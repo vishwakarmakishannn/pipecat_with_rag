@@ -1,0 +1,165 @@
+import asyncio
+from datetime import datetime
+from pathlib import Path
+from typing import List
+
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from pydantic import BaseModel
+from sqlalchemy import func
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+
+from auth import get_current_user
+from database import get_db
+from models import RagChunk, RagFile, User
+from rag import (
+    delete_rag_file_record,
+    normalize_pdf_filename,
+    process_rag_file,
+    rag_storage_path,
+    retrieve_rag_chunks,
+)
+from rag_config import RAG_MAX_UPLOAD_MB
+
+
+router = APIRouter(prefix="/api/files", tags=["files"])
+
+
+class RagFileResponse(BaseModel):
+    id: int
+    filename: str
+    mime_type: str
+    size_bytes: int
+    status: str
+    error: str | None
+    chunk_count: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class RagSearchRequest(BaseModel):
+    query: str
+
+
+class RagSearchResult(BaseModel):
+    file_id: int
+    filename: str
+    page_start: int | None
+    page_end: int | None
+    heading_path: str | None
+    content: str
+    score: float
+
+
+def _file_response(rag_file: RagFile, chunk_count: int = 0) -> RagFileResponse:
+    return RagFileResponse(
+        id=rag_file.id,
+        filename=rag_file.filename,
+        mime_type=rag_file.mime_type,
+        size_bytes=rag_file.size_bytes,
+        status=rag_file.status,
+        error=rag_file.error,
+        chunk_count=chunk_count,
+        created_at=rag_file.created_at,
+        updated_at=rag_file.updated_at,
+    )
+
+
+def _is_pdf_upload(file: UploadFile) -> bool:
+    filename = (file.filename or "").lower()
+    content_type = (file.content_type or "").lower()
+    return filename.endswith(".pdf") and content_type in {
+        "application/pdf",
+        "application/octet-stream",
+        "binary/octet-stream",
+        "",
+    }
+
+
+@router.get("", response_model=List[RagFileResponse])
+async def list_files(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(RagFile, func.count(RagChunk.id).label("chunk_count"))
+        .outerjoin(RagChunk, RagChunk.file_id == RagFile.id)
+        .where(RagFile.user_id == current_user.id)
+        .group_by(RagFile.id)
+        .order_by(RagFile.updated_at.desc(), RagFile.created_at.desc())
+    )
+    return [_file_response(rag_file, chunk_count) for rag_file, chunk_count in result.all()]
+
+
+@router.post("", response_model=RagFileResponse)
+async def upload_file(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    if not _is_pdf_upload(file):
+        raise HTTPException(status_code=400, detail="Only PDF uploads are supported")
+
+    data = await file.read()
+    max_bytes = RAG_MAX_UPLOAD_MB * 1024 * 1024
+    if len(data) > max_bytes:
+        raise HTTPException(status_code=413, detail=f"PDF must be {RAG_MAX_UPLOAD_MB}MB or smaller")
+
+    rag_file = RagFile(
+        user_id=current_user.id,
+        filename=normalize_pdf_filename(file.filename or "document.pdf"),
+        storage_path="",
+        mime_type=file.content_type or "application/pdf",
+        size_bytes=len(data),
+        status="processing",
+    )
+    db.add(rag_file)
+    await db.flush()
+
+    storage_path = rag_storage_path(current_user.id, rag_file.id)
+    Path(storage_path).parent.mkdir(parents=True, exist_ok=True)
+    storage_path.write_bytes(data)
+    rag_file.storage_path = str(storage_path)
+
+    await db.commit()
+    await db.refresh(rag_file)
+
+    asyncio.create_task(process_rag_file(rag_file.id))
+    return _file_response(rag_file, 0)
+
+
+@router.delete("/{file_id}")
+async def delete_file(
+    file_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(RagFile).where(RagFile.id == file_id, RagFile.user_id == current_user.id)
+    )
+    rag_file = result.scalars().first()
+    if not rag_file:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    await delete_rag_file_record(rag_file, db)
+    return {"message": "Deleted successfully"}
+
+
+@router.post("/search", response_model=List[RagSearchResult])
+async def search_files(
+    request: RagSearchRequest,
+    current_user: User = Depends(get_current_user),
+):
+    chunks = await retrieve_rag_chunks(current_user.id, request.query, force=True)
+    return [
+        RagSearchResult(
+            file_id=chunk.file_id,
+            filename=chunk.filename,
+            page_start=chunk.page_start,
+            page_end=chunk.page_end,
+            heading_path=chunk.heading_path,
+            content=chunk.content,
+            score=chunk.score,
+        )
+        for chunk in chunks
+    ]

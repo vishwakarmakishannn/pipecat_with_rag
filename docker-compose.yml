@@ -1,0 +1,16 @@
+services:
+  db:
+    image: pgvector/pgvector:pg15
+    container_name: pipecat_db
+    environment:
+      POSTGRES_USER: pipecat_user
+      POSTGRES_PASSWORD: pipecat_password
+      POSTGRES_DB: pipecat_db
+    ports:
+      - "5434:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  pgdata:
