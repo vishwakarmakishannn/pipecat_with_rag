@@ -33,6 +33,7 @@ def test_message_to_llm_maps_supported_roles_only():
         "content": "hi",
     }
     assert message_to_llm(Message(role="ToolCall", content="{}")) is None
+    assert message_to_llm(Message(role="RagCall", content="{}")) is None
 
 
 def test_build_memory_messages_includes_typed_facts_summary_and_recent_transcript():

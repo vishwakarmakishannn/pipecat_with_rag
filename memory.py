@@ -810,7 +810,7 @@ async def save_conversation_message(
     content: str,
 ) -> Message | None:
     content = (content or "").strip()
-    if not conversation_id or not content or role not in {"You", "Aura", "ToolCall"}:
+    if not conversation_id or not content or role not in {"You", "Aura", "ToolCall", "RagCall"}:
         return None
 
     async with AsyncSessionLocal() as db:

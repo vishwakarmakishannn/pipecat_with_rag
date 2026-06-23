@@ -501,6 +501,29 @@ function VoiceApp({ onResetClient }) {
     }, []),
   );
 
+  useRTVIClientEvent(
+    RTVIEvent.ServerMessage,
+    useCallback((data) => {
+      const messageData = data?.data || data;
+      if (messageData?.type !== 'rag_call' || !messageData.payload) return;
+      const payload = messageData.payload;
+      const ragCallId = payload.rag_call_id || `rag-${Date.now()}`;
+
+      setTranscripts((items) => {
+        if (items.some((item) => item.id === ragCallId)) return items;
+        return [
+          ...items,
+          {
+            id: ragCallId,
+            role: 'RagCall',
+            text: JSON.stringify(payload),
+            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+          }
+        ];
+      });
+    }, []),
+  );
+
   const startConversation = async () => {
     if (!pcClient || isConnecting || !canStart) return;
 
@@ -754,15 +777,15 @@ function VoiceApp({ onResetClient }) {
             <div className="transcript-list">
               {transcripts.map((item) => (
                 <div className="transcript-item" key={item.id}>
-                  <div className={`transcript-avatar ${item.role === 'You' ? 'user-avatar' : item.role === 'ToolCall' ? 'tool-avatar' : 'bot-avatar'}`}>
-                    {item.role === 'You' ? <User size={18} strokeWidth={2.5} /> : item.role === 'ToolCall' ? <Wrench size={16} /> : 'A'}
+                  <div className={`transcript-avatar ${item.role === 'You' ? 'user-avatar' : item.role === 'ToolCall' || item.role === 'RagCall' ? 'tool-avatar' : 'bot-avatar'}`}>
+                    {item.role === 'You' ? <User size={18} strokeWidth={2.5} /> : item.role === 'ToolCall' ? <Wrench size={16} /> : item.role === 'RagCall' ? <FileText size={16} /> : 'A'}
                   </div>
                   <div className="transcript-message">
                     <div className="transcript-role">
-                      {item.role === 'Aura' ? 'Aura AI' : item.role === 'ToolCall' ? 'Tool Call' : item.role}
+                      {item.role === 'Aura' ? 'Aura AI' : item.role === 'ToolCall' ? 'Tool Call' : item.role === 'RagCall' ? 'RAG Call' : item.role}
                       {item.timestamp && <span className="transcript-time">{item.timestamp}</span>}
                     </div>
-                    {item.role === 'ToolCall' ? (() => {
+                    {item.role === 'ToolCall' || item.role === 'RagCall' ? (() => {
                       let parsed;
                       try { parsed = JSON.parse(item.text); } catch { parsed = { function_name: 'Unknown', arguments: item.text }; }
                       return (

@@ -20,13 +20,14 @@ Run the bot using::
     uv run bot.py
 """
 
+import json
 import os
 import time
 
 from dotenv import load_dotenv
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import Frame, LLMFullResponseEndFrame, LLMRunFrame, LLMTextFrame, TranscriptionFrame
+from pipecat.frames.frames import Frame, LLMFullResponseEndFrame, LLMRunFrame, LLMTextFrame, OutputTransportMessageFrame, TranscriptionFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
@@ -46,7 +47,7 @@ from pipecat.transports.daily.transport import DailyParams
 from pipecat.workers.runner import WorkerRunner
 from memory import build_memory_messages, build_turn_memory_context, load_memory_bundle, save_conversation_message
 from memory_config import MEMORY_EMBEDDING_DIMENSION
-from rag import build_rag_context
+from rag import build_rag_context_with_payload
 from rag_config import RAG_VOICE_QUERY_WINDOW_SECONDS
 from tools.tavily import tavily_search
 
@@ -130,9 +131,16 @@ class RollingVoiceQueryBuffer:
 
 
 class RagRetrievalProcessor(FrameProcessor):
-    def __init__(self, user_id: int | None, context: LLMContext, **kwargs):
+    def __init__(
+        self,
+        user_id: int | None,
+        conversation_id: int | None,
+        context: LLMContext,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self._user_id = user_id
+        self._conversation_id = conversation_id
         self._context = context
         self._query_buffer = RollingVoiceQueryBuffer()
 
@@ -145,9 +153,28 @@ class RagRetrievalProcessor(FrameProcessor):
             and isinstance(frame, TranscriptionFrame)
         ):
             combined_query = self._query_buffer.add(frame.text)
-            rag_context = await build_rag_context(self._user_id, combined_query)
+            rag_context, rag_payload = await build_rag_context_with_payload(self._user_id, combined_query)
             if rag_context:
                 self._context.add_message({"role": "developer", "content": rag_context})
+            if rag_payload:
+                await save_conversation_message(
+                    self._conversation_id,
+                    "RagCall",
+                    json.dumps(rag_payload),
+                )
+                await self.push_frame(
+                    OutputTransportMessageFrame(
+                        {
+                            "label": "rtvi-ai",
+                            "type": "server-message",
+                            "data": {
+                                "type": "rag_call",
+                                "payload": rag_payload,
+                            },
+                        }
+                    ),
+                    direction,
+                )
         elif direction == FrameDirection.DOWNSTREAM and isinstance(frame, LLMFullResponseEndFrame):
             self._query_buffer.clear()
 
@@ -197,7 +224,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         tools=[tavily_search]
     )
     memory_retrieval = MemoryRetrievalProcessor(user_id, context, name="MemoryRetrieval")
-    rag_retrieval = RagRetrievalProcessor(user_id, context, name="RagRetrieval")
+    rag_retrieval = RagRetrievalProcessor(user_id, conversation_id, context, name="RagRetrieval")
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
