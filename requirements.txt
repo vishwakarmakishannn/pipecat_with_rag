@@ -10,3 +10,6 @@ pydantic
 pgvector
 python-multipart
 docling
+crawl4ai
+trafilatura
+tavily-python

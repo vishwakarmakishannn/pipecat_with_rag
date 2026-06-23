@@ -10,7 +10,7 @@ import {
   VoiceVisualizer,
 } from '@pipecat-ai/client-react';
 import { SmallWebRTCTransport } from '@pipecat-ai/small-webrtc-transport';
-import { Plus, Mic, Volume2, X, User, MessageSquare, LogOut, Trash2, Wrench, ChevronDown, ChevronRight, Brain, FileText, Upload, RefreshCw } from 'lucide-react';
+import { Plus, Mic, Volume2, X, User, MessageSquare, LogOut, Trash2, Wrench, ChevronDown, ChevronRight, Brain, FileText, Upload, RefreshCw, Link as LinkIcon } from 'lucide-react';
 import { jwtDecode } from 'jwt-decode';
 import Auth from './components/Auth';
 import './App.css';
@@ -54,6 +54,8 @@ function VoiceApp({ onResetClient }) {
   const [ragFiles, setRagFiles] = useState([]);
   const [isFilesLoading, setIsFilesLoading] = useState(false);
   const [isUploadingFile, setIsUploadingFile] = useState(false);
+  const [isAddingLink, setIsAddingLink] = useState(false);
+  const [linkUrl, setLinkUrl] = useState('');
   const [fileError, setFileError] = useState('');
   const currentConversationIdRef = React.useRef(null);
   const transcriptAreaRef = React.useRef(null);
@@ -253,6 +255,35 @@ function VoiceApp({ onResetClient }) {
     }
   };
 
+  const addRagLink = async (event) => {
+    event.preventDefault();
+    const url = linkUrl.trim();
+    if (!url) return;
+
+    setIsAddingLink(true);
+    setFileError('');
+    try {
+      const res = await fetch('http://localhost:7860/api/files/link', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${localStorage.getItem('aura_token')}`
+        },
+        body: JSON.stringify({ url })
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || 'Could not add link');
+      }
+      setLinkUrl('');
+      await fetchFiles();
+    } catch (err) {
+      setFileError(err?.message || 'Could not add link');
+    } finally {
+      setIsAddingLink(false);
+    }
+  };
+
   const deleteRagFile = async (id) => {
     try {
       const res = await fetch(`http://localhost:7860/api/files/${id}`, {
@@ -270,6 +301,22 @@ function VoiceApp({ onResetClient }) {
     if (!sizeBytes) return '0 KB';
     if (sizeBytes < 1024 * 1024) return `${Math.max(1, Math.round(sizeBytes / 1024))} KB`;
     return `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB`;
+  };
+
+  const sourceDisplayName = (file) => {
+    if ((file.source_type || 'pdf') === 'link') {
+      return file.title || file.site_name || file.final_url || file.url || file.filename;
+    }
+    return file.filename;
+  };
+
+  const sourceMeta = (file) => {
+    const sourceType = file.source_type || 'pdf';
+    if (sourceType === 'link') {
+      const url = file.final_url || file.url || '';
+      return `${formatFileSize(file.size_bytes)} · ${file.chunk_count} chunks${url ? ` · ${url}` : ''}`;
+    }
+    return `${formatFileSize(file.size_bytes)} · ${file.chunk_count} chunks`;
   };
 
   const startNewConversation = async () => {
@@ -622,6 +669,21 @@ function VoiceApp({ onResetClient }) {
             )
           ) : (
             <div className="files-panel">
+              <form className="link-form" onSubmit={addRagLink}>
+                <div className="link-input-wrap">
+                  <LinkIcon size={15} />
+                  <input
+                    value={linkUrl}
+                    onChange={(event) => setLinkUrl(event.target.value)}
+                    placeholder="Paste a link"
+                    disabled={isAddingLink}
+                    inputMode="url"
+                  />
+                </div>
+                <button className="link-add-btn" type="submit" disabled={isAddingLink || !linkUrl.trim()}>
+                  {isAddingLink ? 'Adding...' : 'Add'}
+                </button>
+              </form>
               <label className={`file-upload ${isUploadingFile ? 'disabled' : ''}`}>
                 <Upload size={16} />
                 <span>{isUploadingFile ? 'Uploading...' : 'Upload PDF'}</span>
@@ -644,15 +706,20 @@ function VoiceApp({ onResetClient }) {
                 ) : ragFiles.length ? (
                   ragFiles.map((file) => (
                     <div className="file-item" key={file.id}>
-                      <FileText size={17} className="file-icon" />
+                      {(file.source_type || 'pdf') === 'link' ? (
+                        <LinkIcon size={17} className="file-icon" />
+                      ) : (
+                        <FileText size={17} className="file-icon" />
+                      )}
                       <div className="file-details">
-                        <div className="file-name" title={file.filename}>{file.filename}</div>
+                        <div className="file-name" title={sourceDisplayName(file)}>{sourceDisplayName(file)}</div>
                         <div className="file-meta">
-                          {formatFileSize(file.size_bytes)} · {file.chunk_count} chunks
+                          {sourceMeta(file)}
                         </div>
                         {file.error ? <div className="file-error-text">{file.error}</div> : null}
                       </div>
                       <div className="file-actions">
+                        <span className="source-type">{(file.source_type || 'pdf') === 'link' ? 'Link' : 'PDF'}</span>
                         <span className={`file-status ${file.status}`}>{file.status}</span>
                         <button className="delete-btn file-delete" onClick={() => deleteRagFile(file.id)} title="Delete file">
                           <Trash2 size={14} />

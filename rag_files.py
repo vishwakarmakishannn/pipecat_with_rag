@@ -18,6 +18,7 @@ from rag import (
     process_rag_file,
     rag_storage_path,
     retrieve_rag_chunks,
+    validate_public_http_url,
 )
 from rag_config import RAG_MAX_UPLOAD_MB
 
@@ -28,7 +29,12 @@ router = APIRouter(prefix="/api/files", tags=["files"])
 class RagFileResponse(BaseModel):
     id: int
     filename: str
+    source_type: str
     mime_type: str
+    url: str | None
+    final_url: str | None
+    title: str | None
+    site_name: str | None
     size_bytes: int
     status: str
     error: str | None
@@ -39,6 +45,10 @@ class RagFileResponse(BaseModel):
 
 class RagSearchRequest(BaseModel):
     query: str
+
+
+class RagLinkCreate(BaseModel):
+    url: str
 
 
 class RagSearchResult(BaseModel):
@@ -55,7 +65,12 @@ def _file_response(rag_file: RagFile, chunk_count: int = 0) -> RagFileResponse:
     return RagFileResponse(
         id=rag_file.id,
         filename=rag_file.filename,
+        source_type=rag_file.source_type or "pdf",
         mime_type=rag_file.mime_type,
+        url=rag_file.url,
+        final_url=rag_file.final_url,
+        title=rag_file.title,
+        site_name=rag_file.site_name,
         size_bytes=rag_file.size_bytes,
         status=rag_file.status,
         error=rag_file.error,
@@ -110,6 +125,7 @@ async def upload_file(
         filename=normalize_pdf_filename(file.filename or "document.pdf"),
         storage_path="",
         mime_type=file.content_type or "application/pdf",
+        source_type="pdf",
         size_bytes=len(data),
         status="processing",
     )
@@ -121,6 +137,37 @@ async def upload_file(
     storage_path.write_bytes(data)
     rag_file.storage_path = str(storage_path)
 
+    await db.commit()
+    await db.refresh(rag_file)
+
+    asyncio.create_task(process_rag_file(rag_file.id))
+    return _file_response(rag_file, 0)
+
+
+@router.post("/link", response_model=RagFileResponse)
+async def add_link(
+    request: RagLinkCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        url = validate_public_http_url(request.url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    rag_file = RagFile(
+        user_id=current_user.id,
+        filename=url,
+        storage_path="",
+        mime_type="text/markdown",
+        source_type="link",
+        url=url,
+        final_url=url,
+        site_name=url,
+        size_bytes=0,
+        status="processing",
+    )
+    db.add(rag_file)
     await db.commit()
     await db.refresh(rag_file)
 

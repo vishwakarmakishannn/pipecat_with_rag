@@ -312,6 +312,13 @@ if __name__ == "__main__":
             await conn.execute(text("UPDATE user_memories SET status = 'active' WHERE status IS NULL"))
             await conn.execute(text("UPDATE user_memories SET key = 'real_name' WHERE key = 'name'"))
             await conn.execute(text("ALTER TABLE user_memories DROP CONSTRAINT IF EXISTS uq_user_memory_key"))
+            await conn.execute(text("ALTER TABLE rag_files ADD COLUMN IF NOT EXISTS source_type VARCHAR DEFAULT 'pdf' NOT NULL"))
+            await conn.execute(text("ALTER TABLE rag_files ADD COLUMN IF NOT EXISTS url TEXT"))
+            await conn.execute(text("ALTER TABLE rag_files ADD COLUMN IF NOT EXISTS final_url TEXT"))
+            await conn.execute(text("ALTER TABLE rag_files ADD COLUMN IF NOT EXISTS title TEXT"))
+            await conn.execute(text("ALTER TABLE rag_files ADD COLUMN IF NOT EXISTS site_name TEXT"))
+            await conn.execute(text("ALTER TABLE rag_files ADD COLUMN IF NOT EXISTS content_hash VARCHAR"))
+            await conn.execute(text("UPDATE rag_files SET source_type = 'pdf' WHERE source_type IS NULL"))
             await conn.execute(text(
                 """
                 DO $$

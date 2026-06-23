@@ -533,7 +533,10 @@ def _valid_fact_event(event: dict[str, Any]) -> dict[str, Any] | None:
 async def classify_memory_events(user_text: str, assistant_text: str | None = None) -> list[dict[str, Any]]:
     prompt = (
         "You classify durable user memory from a voice conversation turn. Return strict JSON only.\n"
-        "Do not infer. Do not store temporary states like 'I'm fine'. \n"
+        "CRITICAL RULES:\n"
+        "1. ONLY extract facts about the speaker (the user). Ignore any names, roles, or facts about third parties or other people mentioned.\n"
+        "2. If the user is asking a question or looking up information, do NOT extract memory (return empty events).\n"
+        "3. Do not infer. Do not store temporary states like 'I'm fine'.\n"
         "Use keys: real_name, preferred_name, location, role, preferred_language, likes, dislikes, interests, goals.\n"
         "Single-value keys overwrite only their same key. Multi-value keys append. Use deactivate when the user retracts a fact.\n\n"
         "Schema: {\"events\":[{\"action\":\"upsert|deactivate|ignore\",\"fact_type\":\"profile|preference|goal\","
