@@ -1,7 +1,7 @@
 fastapi
 loguru
 python-dotenv
-pipecat-ai[cartesia,daily,deepgram,openai,google,silero,runner,webrtc]
+pipecat-ai[cartesia,daily,deepgram,openai,google,silero,runner,webrtc,piper]
 sqlalchemy
 asyncpg
 passlib[bcrypt]

@@ -50,6 +50,7 @@ from memory_config import MEMORY_EMBEDDING_DIMENSION
 from rag import build_rag_context_with_payload
 from rag_config import RAG_VOICE_QUERY_WINDOW_SECONDS
 from tools.tavily import tavily_search
+from tools.raise_issue import raise_issue
 
 load_dotenv(override=True)
 
@@ -221,7 +222,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
 
     context = LLMContext(
         messages=memory_messages,
-        tools=[tavily_search]
+        tools=[tavily_search, raise_issue]
     )
     memory_retrieval = MemoryRetrievalProcessor(user_id, context, name="MemoryRetrieval")
     rag_retrieval = RagRetrievalProcessor(user_id, conversation_id, context, name="RagRetrieval")

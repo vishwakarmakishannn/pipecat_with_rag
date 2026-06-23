@@ -124,3 +124,17 @@ class RagChunk(Base):
 
     user = relationship("User", back_populates="rag_chunks")
     file = relationship("RagFile", back_populates="chunks")
+
+
+class Issue(Base):
+    __tablename__ = "issues"
+
+    id = Column(Integer, primary_key=True, index=True)
+    cust_id = Column(String, nullable=False)
+    email = Column(String, nullable=False)
+    mobile = Column(String, nullable=False)
+    device_id = Column(String, nullable=False)
+    description = Column(Text, nullable=False)
+    status = Column(String, nullable=False, default="raised")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

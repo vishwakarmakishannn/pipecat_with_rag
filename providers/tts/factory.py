@@ -6,5 +6,8 @@ def get_tts():
     if provider == "cartesia":
         from .cartesia_tts import get_cartesia_tts
         return get_cartesia_tts()
+    elif provider == "piper":
+        from .piper_tts import get_piper_tts
+        return get_piper_tts()
     else:
         raise ValueError(f"Unsupported TTS provider: {provider}")
