@@ -15,9 +15,10 @@ import { jwtDecode } from 'jwt-decode';
 import Auth from './components/Auth';
 import './App.css';
 
+const API_BASE = `${window.location.protocol}//${window.location.hostname}:7860`;
 const START_ENDPOINT =
   import.meta.env.VITE_PIPECAT_START_URL ||
-  `${window.location.protocol}//${window.location.hostname}:7860/start`;
+  `${API_BASE}/start`;
 
 function createPipecatClient() {
   return new PipecatClient({
@@ -82,7 +83,7 @@ function VoiceApp({ onResetClient }) {
 
   const fetchConversations = useCallback(async () => {
     try {
-      const res = await fetch('http://localhost:7860/api/conversations', {
+      const res = await fetch(`${API_BASE}/api/conversations`, {
         headers: { Authorization: `Bearer ${localStorage.getItem('aura_token')}` }
       });
       if (res.ok) setConversations(await res.json());
@@ -95,7 +96,7 @@ function VoiceApp({ onResetClient }) {
     setIsMemoryLoading(true);
     setMemoryError('');
     try {
-      const res = await fetch('http://localhost:7860/api/memories', {
+      const res = await fetch(`${API_BASE}/api/memories`, {
         headers: { Authorization: `Bearer ${localStorage.getItem('aura_token')}` }
       });
       if (!res.ok) throw new Error('Could not load memories');
@@ -111,7 +112,7 @@ function VoiceApp({ onResetClient }) {
     setIsFilesLoading(true);
     setFileError('');
     try {
-      const res = await fetch('http://localhost:7860/api/files', {
+      const res = await fetch(`${API_BASE}/api/files`, {
         headers: { Authorization: `Bearer ${localStorage.getItem('aura_token')}` }
       });
       if (!res.ok) throw new Error('Could not load files');
@@ -159,7 +160,7 @@ function VoiceApp({ onResetClient }) {
     currentConversationIdRef.current = id;
     setCurrentConversationId(id);
     try {
-      const res = await fetch(`http://localhost:7860/api/conversations/${id}/messages`, {
+      const res = await fetch(`${API_BASE}/api/conversations/${id}/messages`, {
         headers: { Authorization: `Bearer ${localStorage.getItem('aura_token')}` }
       });
       if (res.ok) {
@@ -179,7 +180,7 @@ function VoiceApp({ onResetClient }) {
   const deleteConversation = async (e, id) => {
     e.stopPropagation();
     try {
-      const res = await fetch(`http://localhost:7860/api/conversations/${id}`, {
+      const res = await fetch(`${API_BASE}/api/conversations/${id}`, {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${localStorage.getItem('aura_token')}` }
       });
@@ -204,7 +205,7 @@ function VoiceApp({ onResetClient }) {
 
   const deleteMemory = async (id) => {
     try {
-      const res = await fetch(`http://localhost:7860/api/memories/${id}`, {
+      const res = await fetch(`${API_BASE}/api/memories/${id}`, {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${localStorage.getItem('aura_token')}` }
       });
@@ -217,7 +218,7 @@ function VoiceApp({ onResetClient }) {
 
   const deleteAllMemories = async () => {
     try {
-      const res = await fetch('http://localhost:7860/api/memories', {
+      const res = await fetch(`${API_BASE}/api/memories`, {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${localStorage.getItem('aura_token')}` }
       });
@@ -238,7 +239,7 @@ function VoiceApp({ onResetClient }) {
     try {
       const formData = new FormData();
       formData.append('file', file);
-      const res = await fetch('http://localhost:7860/api/files', {
+      const res = await fetch(`${API_BASE}/api/files`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${localStorage.getItem('aura_token')}` },
         body: formData,
@@ -263,7 +264,7 @@ function VoiceApp({ onResetClient }) {
     setIsAddingLink(true);
     setFileError('');
     try {
-      const res = await fetch('http://localhost:7860/api/files/link', {
+      const res = await fetch(`${API_BASE}/api/files/link`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -286,7 +287,7 @@ function VoiceApp({ onResetClient }) {
 
   const deleteRagFile = async (id) => {
     try {
-      const res = await fetch(`http://localhost:7860/api/files/${id}`, {
+      const res = await fetch(`${API_BASE}/api/files/${id}`, {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${localStorage.getItem('aura_token')}` }
       });
@@ -331,7 +332,7 @@ function VoiceApp({ onResetClient }) {
     if (!convId) return;
 
     try {
-      const res = await fetch(`http://localhost:7860/api/conversations/${convId}/messages`, {
+      const res = await fetch(`${API_BASE}/api/conversations/${convId}/messages`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -533,7 +534,7 @@ function VoiceApp({ onResetClient }) {
     try {
       let convId = currentConversationId;
       if (!convId) {
-        const res = await fetch('http://localhost:7860/api/conversations', {
+        const res = await fetch(`${API_BASE}/api/conversations`, {
           method: 'POST',
           headers: { 
             'Content-Type': 'application/json',

@@ -2,6 +2,8 @@ import { useState } from 'react';
 import { User, Lock, ArrowRight, UserPlus } from 'lucide-react';
 import './Auth.css';
 
+const API_BASE = `${window.location.protocol}//${window.location.hostname}:7860`;
+
 export default function Auth({ onLogin }) {
   const [isLogin, setIsLogin] = useState(true);
   const [username, setUsername] = useState('');
@@ -17,8 +19,8 @@ export default function Auth({ onLogin }) {
     const endpoint = isLogin ? '/api/auth/login' : '/api/auth/register';
     
     try {
-      // In Vite, proxy might not be configured, so we hardcode the backend URL for now.
-      const res = await fetch(`http://localhost:7860${endpoint}`, {
+      // Use dynamic API base instead of hardcoded localhost
+      const res = await fetch(`${API_BASE}${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username, password })

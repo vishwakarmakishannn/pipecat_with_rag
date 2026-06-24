@@ -899,3 +899,39 @@
   white-space: pre-wrap;
   word-wrap: break-word;
 }
+
+/* Mobile Responsiveness */
+@media (max-width: 768px) {
+  .app-container {
+    flex-direction: column;
+    padding: 8px;
+    gap: 8px;
+  }
+  .sidebar {
+    width: 100%;
+    flex: 0 0 45%;
+    max-height: 45%;
+  }
+  .main-stage {
+    width: 100%;
+    flex: 1;
+  }
+  .transcription-area {
+    padding: 16px 20px;
+  }
+  .voice-controls-area {
+    padding: 16px 0 20px 0;
+    gap: 12px;
+  }
+  .mic-button {
+    width: 64px;
+    height: 64px;
+  }
+  .mic-icon {
+    width: 24px;
+    height: 24px;
+  }
+  .voice-visualizer-container {
+    height: 40px;
+  }
+}
