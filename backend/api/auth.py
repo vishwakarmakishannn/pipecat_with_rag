@@ -8,8 +8,8 @@ from sqlalchemy.future import select
 import bcrypt
 from pydantic import BaseModel
 
-from database import get_db
-from models import User
+from core.database import get_db
+from core.models import User
 
 SECRET_KEY = os.getenv("JWT_SECRET", "supersecret-aura-voice-key")
 ALGORITHM = "HS256"

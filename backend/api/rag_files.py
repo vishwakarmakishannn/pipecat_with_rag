@@ -9,10 +9,10 @@ from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
-from auth import get_current_user
-from database import get_db
-from models import RagChunk, RagFile, User
-from rag import (
+from api.auth import get_current_user
+from core.database import get_db
+from core.models import RagChunk, RagFile, User
+from services.rag import (
     delete_rag_file_record,
     normalize_pdf_filename,
     process_rag_file,
@@ -20,7 +20,7 @@ from rag import (
     retrieve_rag_chunks,
     validate_public_http_url,
 )
-from rag_config import RAG_MAX_UPLOAD_MB
+from core.rag_config import RAG_MAX_UPLOAD_MB
 
 
 router = APIRouter(prefix="/api/files", tags=["files"])

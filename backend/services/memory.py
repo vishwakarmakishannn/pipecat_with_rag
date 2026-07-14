@@ -13,9 +13,9 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
-from auth import ALGORITHM, SECRET_KEY
-from database import AsyncSessionLocal
-from memory_config import (
+from api.auth import ALGORITHM, SECRET_KEY
+from core.database import AsyncSessionLocal
+from core.memory_config import (
     MEMORY_EMBEDDING_DIMENSION,
     MEMORY_EMBEDDING_PROVIDER,
     MEMORY_FACT_CONFIDENCE_MIN,
@@ -28,7 +28,7 @@ from memory_config import (
     SUMMARY_CHAR_THRESHOLD,
     SUMMARY_MESSAGE_THRESHOLD,
 )
-from models import Conversation, MemoryChunk, Message, User, UserMemory
+from core.models import Conversation, MemoryChunk, Message, User, UserMemory
 
 
 SINGLE_VALUE_KEYS = {"real_name", "preferred_name", "location", "role", "preferred_language"}

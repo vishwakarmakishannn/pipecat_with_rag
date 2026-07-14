@@ -1,6 +1,6 @@
 import os
 from pipecat.services.groq.llm import GroqLLMService, GroqLLMSettings
-from prompt_config import load_system_prompt
+from core.prompt_config import load_system_prompt
 
 def get_groq_llm():
     return GroqLLMService(

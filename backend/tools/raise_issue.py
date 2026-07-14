@@ -1,7 +1,7 @@
 import re
 from pipecat.services.llm_service import FunctionCallParams
-from database import AsyncSessionLocal
-from models import Issue
+from core.database import AsyncSessionLocal
+from core.models import Issue
 
 async def raise_issue(
     params: FunctionCallParams,

@@ -1,6 +1,6 @@
 import pytest
 
-from memory import (
+from services.memory import (
     MemoryBundle,
     build_memory_chunk,
     build_memory_messages,
@@ -8,7 +8,7 @@ from memory import (
     classify_memory_events,
     message_to_llm,
 )
-from models import Conversation, MemoryChunk, Message, User, UserMemory
+from core.models import Conversation, MemoryChunk, Message, User, UserMemory
 
 
 def test_build_memory_messages_ignores_invalid_name_memory():
@@ -98,7 +98,7 @@ async def test_classifier_rejects_invalid_name_memory(monkeypatch):
     async def fake_generate(_prompt):
         return '{"events":[{"action":"upsert","fact_type":"profile","key":"real_name","value":"fine","confidence":0.99,"durability":"stable"}]}'
 
-    monkeypatch.setattr("memory._generate_text_with_memory_llm", fake_generate)
+    monkeypatch.setattr("services.memory._generate_text_with_memory_llm", fake_generate)
 
     events = await classify_memory_events("I'm fine.")
 
@@ -110,7 +110,7 @@ async def test_classifier_treats_temporary_call_me_as_ignored(monkeypatch):
     async def fake_generate(_prompt):
         return '{"events":[{"action":"upsert","fact_type":"profile","key":"preferred_name","value":"Raj","confidence":0.95,"durability":"temporary"}]}'
 
-    monkeypatch.setattr("memory._generate_text_with_memory_llm", fake_generate)
+    monkeypatch.setattr("services.memory._generate_text_with_memory_llm", fake_generate)
 
     events = await classify_memory_events("Call me Raj for now.")
 
@@ -149,7 +149,7 @@ async def test_turn_memory_context_formats_retrieved_chunks(monkeypatch):
             )
         ]
 
-    monkeypatch.setattr("memory.retrieve_semantic_memories", fake_retrieve)
+    monkeypatch.setattr("services.memory.retrieve_semantic_memories", fake_retrieve)
 
     context = await build_turn_memory_context(1, "What did we discuss about AI?")
 

@@ -3,8 +3,8 @@ from sqlalchemy.dialects.postgresql import TSVECTOR
 from sqlalchemy.orm import relationship
 from pgvector.sqlalchemy import Vector
 from datetime import datetime
-from database import Base
-from memory_config import MEMORY_EMBEDDING_DIMENSION
+from core.database import Base
+from core.memory_config import MEMORY_EMBEDDING_DIMENSION
 
 class User(Base):
     __tablename__ = "users"

@@ -1,6 +1,6 @@
 import os
 from pipecat.services.google.llm import GoogleLLMService
-from prompt_config import load_system_prompt
+from core.prompt_config import load_system_prompt
 
 def get_google_llm():
     return GoogleLLMService(

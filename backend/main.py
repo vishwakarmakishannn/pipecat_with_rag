@@ -20,6 +20,7 @@ Run the bot using::
     uv run bot.py
 """
 
+import asyncio
 import json
 import os
 import time
@@ -27,7 +28,16 @@ import time
 from dotenv import load_dotenv
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import Frame, LLMFullResponseEndFrame, LLMRunFrame, LLMTextFrame, OutputTransportMessageFrame, TranscriptionFrame
+from pipecat.frames.frames import (
+    Frame,
+    LLMFullResponseEndFrame,
+    LLMRunFrame,
+    LLMTextFrame,
+    OutputTransportMessageFrame,
+    TranscriptionFrame,
+    FunctionCallInProgressFrame,
+    TTSSpeakFrame,
+)
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
@@ -45,10 +55,10 @@ from providers.tts.factory import get_tts
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
 from pipecat.workers.runner import WorkerRunner
-from memory import build_memory_messages, build_turn_memory_context, load_memory_bundle, save_conversation_message
-from memory_config import MEMORY_EMBEDDING_DIMENSION
-from rag import build_rag_context_with_payload
-from rag_config import RAG_VOICE_QUERY_WINDOW_SECONDS
+from services.memory import build_memory_messages, build_turn_memory_context, load_memory_bundle, save_conversation_message
+from core.memory_config import MEMORY_EMBEDDING_DIMENSION
+from services.rag import build_rag_context_with_payload, is_rag_query
+from core.rag_config import RAG_VOICE_QUERY_WINDOW_SECONDS
 from tools.tavily import tavily_search
 from tools.raise_issue import raise_issue
 
@@ -70,7 +80,7 @@ class ConversationMemoryProcessor(FrameProcessor):
             and self._capture == "user"
             and isinstance(frame, TranscriptionFrame)
         ):
-            await save_conversation_message(self._conversation_id, "You", frame.text)
+            asyncio.create_task(save_conversation_message(self._conversation_id, "You", frame.text))
         elif (
             direction == FrameDirection.DOWNSTREAM
             and self._capture == "assistant"
@@ -84,28 +94,17 @@ class ConversationMemoryProcessor(FrameProcessor):
         ):
             assistant_text = "".join(self._assistant_chunks).strip()
             self._assistant_chunks.clear()
-            await save_conversation_message(self._conversation_id, "Aura", assistant_text)
+            asyncio.create_task(save_conversation_message(self._conversation_id, "Aura", assistant_text))
 
         await self.push_frame(frame, direction)
 
 
-class MemoryRetrievalProcessor(FrameProcessor):
-    def __init__(self, user_id: int | None, context: LLMContext, **kwargs):
-        super().__init__(**kwargs)
-        self._user_id = user_id
-        self._context = context
-
+class ToolFillerProcessor(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
-        if (
-            direction == FrameDirection.DOWNSTREAM
-            and self._user_id
-            and isinstance(frame, TranscriptionFrame)
-        ):
-            memory_context = await build_turn_memory_context(self._user_id, frame.text)
-            if memory_context:
-                self._context.add_message({"role": "developer", "content": memory_context})
+        if direction == FrameDirection.DOWNSTREAM and isinstance(frame, FunctionCallInProgressFrame):
+            await self.push_frame(TTSSpeakFrame("Let me look that up for you.", append_to_context=False), direction)
 
         await self.push_frame(frame, direction)
 
@@ -131,7 +130,7 @@ class RollingVoiceQueryBuffer:
         self._items.clear()
 
 
-class RagRetrievalProcessor(FrameProcessor):
+class ContextRetrievalProcessor(FrameProcessor):
     def __init__(
         self,
         user_id: int | None,
@@ -154,15 +153,25 @@ class RagRetrievalProcessor(FrameProcessor):
             and isinstance(frame, TranscriptionFrame)
         ):
             combined_query = self._query_buffer.add(frame.text)
-            rag_context, rag_payload = await build_rag_context_with_payload(self._user_id, combined_query)
+            
+            if is_rag_query(frame.text):
+                await self.push_frame(TTSSpeakFrame("Let me check your files for that.", append_to_context=False), direction)
+            
+            memory_task = asyncio.create_task(build_turn_memory_context(self._user_id, frame.text))
+            rag_task = asyncio.create_task(build_rag_context_with_payload(self._user_id, combined_query))
+            
+            memory_context, (rag_context, rag_payload) = await asyncio.gather(memory_task, rag_task)
+            
+            if memory_context:
+                self._context.add_message({"role": "developer", "content": memory_context})
             if rag_context:
                 self._context.add_message({"role": "developer", "content": rag_context})
             if rag_payload:
-                await save_conversation_message(
+                asyncio.create_task(save_conversation_message(
                     self._conversation_id,
                     "RagCall",
                     json.dumps(rag_payload),
-                )
+                ))
                 await self.push_frame(
                     OutputTransportMessageFrame(
                         {
@@ -224,8 +233,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         messages=memory_messages,
         tools=[tavily_search, raise_issue]
     )
-    memory_retrieval = MemoryRetrievalProcessor(user_id, context, name="MemoryRetrieval")
-    rag_retrieval = RagRetrievalProcessor(user_id, conversation_id, context, name="RagRetrieval")
+    context_retrieval = ContextRetrievalProcessor(user_id, conversation_id, context, name="ContextRetrieval")
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
@@ -233,16 +241,18 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         ),
     )
 
+    tool_filler = ToolFillerProcessor(name="ToolFiller")
+
     # Pipeline - assembled from reusable components
     pipeline = Pipeline(
         [
             transport.input(),
             stt,
             user_memory,
-            memory_retrieval,
-            rag_retrieval,
+            context_retrieval,
             user_aggregator,
             llm,
+            tool_filler,
             assistant_memory,
             tts,
             transport.output(),
@@ -310,10 +320,10 @@ async def bot(runner_args: RunnerArguments):
 
 if __name__ == "__main__":
     from pipecat.runner.run import app, main
-    from auth import router as auth_router
-    from history import router as history_router
-    from memories import router as memories_router
-    from rag_files import router as rag_files_router
+    from api.auth import router as auth_router
+    from api.history import router as history_router
+    from api.memories import router as memories_router
+    from api.rag_files import router as rag_files_router
     
     # Mount the authentication routes
     app.include_router(auth_router)
@@ -324,7 +334,7 @@ if __name__ == "__main__":
     # Initialize the database on startup
     @app.on_event("startup")
     async def startup_event():
-        from database import engine, Base
+        from core.database import engine, Base
         async with engine.begin() as conn:
             from sqlalchemy import text
             await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))

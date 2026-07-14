@@ -6,9 +6,9 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
-from auth import get_current_user
-from database import get_db
-from models import User, UserMemory
+from api.auth import get_current_user
+from core.database import get_db
+from core.models import User, UserMemory
 
 
 router = APIRouter(prefix="/api/memories", tags=["memories"])

@@ -17,10 +17,10 @@ from loguru import logger
 from sqlalchemy import delete, func, literal_column
 from sqlalchemy.future import select
 
-from database import AsyncSessionLocal
-from memory import embed_text
-from models import RagChunk, RagFile
-from rag_config import (
+from core.database import AsyncSessionLocal
+from services.memory import embed_text
+from core.models import RagChunk, RagFile
+from core.rag_config import (
     RAG_CONTEXT_CHUNK_CHARS,
     RAG_LINK_CHUNK_CHARS,
     RAG_LINK_CHUNK_OVERLAP,

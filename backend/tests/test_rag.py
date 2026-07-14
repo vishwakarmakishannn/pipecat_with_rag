@@ -1,7 +1,7 @@
 import pytest
 
-from bot import RollingVoiceQueryBuffer
-from rag import (
+from main import RollingVoiceQueryBuffer
+from services.rag import (
     RetrievedRagChunk,
     build_rag_context,
     chunk_link_markdown,
@@ -153,7 +153,7 @@ async def test_build_rag_context_formats_retrieved_chunks(monkeypatch):
             )
         ]
 
-    monkeypatch.setattr("rag.retrieve_rag_chunks", fake_retrieve)
+    monkeypatch.setattr("services.rag.retrieve_rag_chunks", fake_retrieve)
 
     context = await build_rag_context(7, "What does my PDF say about AI?")
 
@@ -184,7 +184,7 @@ async def test_build_rag_context_formats_link_chunks(monkeypatch):
             )
         ]
 
-    monkeypatch.setattr("rag.retrieve_rag_chunks", fake_retrieve)
+    monkeypatch.setattr("services.rag.retrieve_rag_chunks", fake_retrieve)
 
     context = await build_rag_context(7, "What does the article say?")
 
