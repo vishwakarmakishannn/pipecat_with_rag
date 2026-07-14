@@ -1,0 +1,2 @@
+sentence-transformers
+websockets==14.1

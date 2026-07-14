@@ -304,15 +304,35 @@ def chunk_link_markdown(markdown: str, title: str | None, final_url: str) -> lis
     return parsed_chunks
 
 
-async def _extract_link_with_crawl4ai(url: str) -> ExtractedLink:
-    from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
-    from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
+def _markdown_text(markdown_obj: Any) -> str:
+    """
+    Crawl4AI may return markdown as a string or as a MarkdownGenerationResult-like object.
+    This helper normalizes it into a plain string.
+    """
+    if markdown_obj is None:
+        return ""
+    if isinstance(markdown_obj, str):
+        return markdown_obj
+    for attr in ("fit_markdown", "raw_markdown", "markdown_with_citations", "references_markdown"):
+        value = getattr(markdown_obj, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value
+    return str(markdown_obj)
 
-    browser_config = BrowserConfig(headless=True, user_agent=RAG_LINK_USER_AGENT)
+
+async def _extract_link_with_crawl4ai(url: str) -> ExtractedLink:
+    from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
+
+    browser_config = BrowserConfig(
+        headless=True,
+        verbose=False,
+    )
     run_config = CrawlerRunConfig(
-        markdown_generator=DefaultMarkdownGenerator(),
-        wait_until="networkidle",
+        cache_mode=CacheMode.BYPASS,
+        wait_until="domcontentloaded",
         page_timeout=int(RAG_LINK_TIMEOUT_SECONDS * 1000),
+        delay_before_return_html=0.1,
+        scan_full_page=True,
     )
     async with AsyncWebCrawler(config=browser_config) as crawler:
         result = await crawler.arun(url=url, config=run_config)
@@ -322,15 +342,23 @@ async def _extract_link_with_crawl4ai(url: str) -> ExtractedLink:
         raise ValueError(error)
 
     markdown_obj = getattr(result, "markdown", None)
-    markdown = getattr(markdown_obj, "fit_markdown", None) or getattr(markdown_obj, "raw_markdown", None) or str(markdown_obj or "")
+    markdown = _markdown_text(markdown_obj)
+    
     metadata = getattr(result, "metadata", None) or {}
     final_url = getattr(result, "url", None) or url
     validate_public_http_url(final_url)
+    
+    title = None
+    site_name = None
+    if isinstance(metadata, dict):
+        title = metadata.get("title") or metadata.get("og:title")
+        site_name = metadata.get("site_name") or metadata.get("og:site_name")
+
     return ExtractedLink(
         markdown=_normalize_markdown(markdown),
         final_url=final_url,
-        title=metadata.get("title") if isinstance(metadata, dict) else None,
-        site_name=metadata.get("site_name") if isinstance(metadata, dict) else None,
+        title=title,
+        site_name=site_name,
     )
 
 
@@ -374,8 +402,6 @@ async def _extract_link_with_trafilatura(url: str) -> ExtractedLink:
 
 async def extract_link(url: str) -> ExtractedLink:
     validated_url = await asyncio.to_thread(validate_public_http_url, url)
-    if not await asyncio.to_thread(_robots_allowed, validated_url):
-        raise ValueError("This site disallows automated fetching for this URL")
 
     errors = []
     if RAG_LINK_EXTRACTOR == "crawl4ai":

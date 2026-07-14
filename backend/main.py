@@ -155,7 +155,7 @@ class ContextRetrievalProcessor(FrameProcessor):
             combined_query = self._query_buffer.add(frame.text)
             
             if is_rag_query(frame.text):
-                await self.push_frame(TTSSpeakFrame("Let me check your files for that.", append_to_context=False), direction)
+                await self.push_frame(TTSSpeakFrame("Let me look that up for you.", append_to_context=False), direction)
             
             memory_task = asyncio.create_task(build_turn_memory_context(self._user_id, frame.text))
             rag_task = asyncio.create_task(build_rag_context_with_payload(self._user_id, combined_query))
@@ -331,9 +331,11 @@ if __name__ == "__main__":
     app.include_router(memories_router)
     app.include_router(rag_files_router)
     
-    # Initialize the database on startup
-    @app.on_event("startup")
-    async def startup_event():
+    from contextlib import asynccontextmanager
+    
+    # Initialize the database and eagerly load models on startup
+    @asynccontextmanager
+    async def lifespan(app):
         from core.database import engine, Base
         async with engine.begin() as conn:
             from sqlalchemy import text
@@ -434,5 +436,18 @@ if __name__ == "__main__":
                 ))
             except Exception as exc:
                 logger.warning(f"RAG index setup skipped: {exc}")
+                
+        # Eagerly load the embedding model to avoid latency on first use
+        try:
+            from services.memory import _get_embedding_model_async
+            logger.info("Eagerly loading embedding model at startup...")
+            await _get_embedding_model_async()
+            logger.info("Embedding model loaded successfully.")
+        except Exception as exc:
+            logger.error(f"Failed to load embedding model at startup: {exc}")
+            
+        yield
+
+    app.router.lifespan_context = lifespan
 
     main()

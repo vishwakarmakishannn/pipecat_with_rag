@@ -369,6 +369,23 @@ async def _generate_text_with_memory_llm(prompt: str) -> str | None:
     return None
 
 
+_embedding_model = None
+_embedding_lock = asyncio.Lock()
+
+async def _get_embedding_model_async():
+    global _embedding_model
+    if _embedding_model is None:
+        async with _embedding_lock:
+            if _embedding_model is None:
+                def load_model():
+                    from sentence_transformers import SentenceTransformer
+                    logger.info("Loading offline embedding model BAAI/bge-base-en-v1.5...")
+                    return SentenceTransformer("BAAI/bge-base-en-v1.5")
+                _embedding_model = await asyncio.to_thread(load_model)
+                logger.info("Offline embedding model loaded.")
+    return _embedding_model
+
+
 async def embed_text(value: str) -> list[float] | None:
     value = (value or "").strip()
     if not value or MEMORY_VECTOR_DB != "pgvector":
@@ -385,66 +402,20 @@ async def embed_text(value: str) -> list[float] | None:
             return None
         return embedding
 
-    async def embed_google() -> list[float] | None:
-        api_key = os.getenv("GOOGLE_API_KEY")
-        if not api_key:
-            return None
+    # Load model outside the timeout block so the initial download doesn't time out
+    model = await _get_embedding_model_async()
 
-        def call_google():
-            from google import genai
+    async def embed_local() -> list[float] | None:
+        def call_local():
+            embedding = model.encode(value, normalize_embeddings=True)
+            return normalize_embedding(embedding.tolist(), "Local")
 
-            client = genai.Client(api_key=api_key)
-            model = os.getenv("GOOGLE_EMBEDDING_MODEL", "gemini-embedding-001")
-            try:
-                from google.genai import types
+        return await asyncio.to_thread(call_local)
 
-                response = client.models.embed_content(
-                    model=model,
-                    contents=value,
-                    config=types.EmbedContentConfig(
-                        outputDimensionality=MEMORY_EMBEDDING_DIMENSION,
-                    ),
-                )
-            except TypeError:
-                response = client.models.embed_content(model=model, contents=value)
-            embeddings = getattr(response, "embeddings", None)
-            if embeddings:
-                return normalize_embedding(list(getattr(embeddings[0], "values", []) or []), "Google")
-            embedding = getattr(response, "embedding", None)
-            values = list(getattr(embedding, "values", []) or []) if embedding else None
-            return normalize_embedding(values, "Google")
-
-        return await asyncio.to_thread(call_google)
-
-    async def embed_openai() -> list[float] | None:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            return None
-
-        def call_openai():
-            from openai import OpenAI
-
-            client = OpenAI(api_key=api_key)
-            model = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-            kwargs = {"model": model, "input": value}
-            if model.startswith("text-embedding-3"):
-                kwargs["dimensions"] = MEMORY_EMBEDDING_DIMENSION
-            response = client.embeddings.create(**kwargs)
-            return normalize_embedding(list(response.data[0].embedding), "OpenAI")
-
-        return await asyncio.to_thread(call_openai)
-
-    generators = [embed_google, embed_openai]
-    if MEMORY_EMBEDDING_PROVIDER != "google":
-        generators.reverse()
-
-    for generator in generators:
-        try:
-            embedding = await asyncio.wait_for(generator(), timeout=MEMORY_LLM_TIMEOUT_SECONDS)
-            if embedding:
-                return embedding
-        except Exception as exc:
-            logger.warning(f"Embedding call failed: {exc}")
+    try:
+        return await asyncio.wait_for(embed_local(), timeout=MEMORY_LLM_TIMEOUT_SECONDS * 5)
+    except Exception as exc:
+        logger.warning(f"Embedding call failed: {exc}")
     return None
 
 

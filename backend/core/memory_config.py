@@ -24,7 +24,7 @@ MEMORY_FACT_CONFIDENCE_MIN = env_float("MEMORY_FACT_CONFIDENCE_MIN", 0.85)
 MEMORY_RECALL_TOP_K = env_int("MEMORY_RECALL_TOP_K", 5)
 MEMORY_RECALL_MIN_SCORE = env_float("MEMORY_RECALL_MIN_SCORE", 0.72)
 MEMORY_VECTOR_DB = os.getenv("MEMORY_VECTOR_DB", "pgvector").lower()
-MEMORY_EMBEDDING_PROVIDER = os.getenv("MEMORY_EMBEDDING_PROVIDER", "google").lower()
+MEMORY_EMBEDDING_PROVIDER = os.getenv("MEMORY_EMBEDDING_PROVIDER", "local").lower()
 
 # Keep the DB schema provider-neutral by storing one fixed vector size.
 # Both Google gemini-embedding-001 and OpenAI text-embedding-3-small can be used
