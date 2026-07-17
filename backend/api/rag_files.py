@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import List
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, HttpUrl
 from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -16,7 +16,6 @@ from services.rag import (
     delete_rag_file_record,
     normalize_pdf_filename,
     process_rag_file,
-    rag_storage_path,
     retrieve_rag_chunks,
     validate_public_http_url,
 )
@@ -44,11 +43,11 @@ class RagFileResponse(BaseModel):
 
 
 class RagSearchRequest(BaseModel):
-    query: str
+    query: str = Field(..., min_length=1, max_length=1000)
 
 
 class RagLinkCreate(BaseModel):
-    url: str
+    url: HttpUrl
 
 
 class RagSearchResult(BaseModel):
@@ -132,15 +131,16 @@ async def upload_file(
     db.add(rag_file)
     await db.flush()
 
-    storage_path = rag_storage_path(current_user.id, rag_file.id)
-    Path(storage_path).parent.mkdir(parents=True, exist_ok=True)
-    storage_path.write_bytes(data)
-    rag_file.storage_path = str(storage_path)
+    from core.storage import storage_client
+    object_name = f"{current_user.id}/{rag_file.id}.pdf"
+    storage_path = await storage_client.upload_file(data, object_name)
+    rag_file.storage_path = storage_path
 
     await db.commit()
     await db.refresh(rag_file)
 
-    asyncio.create_task(process_rag_file(rag_file.id))
+    from core.task_queue import task_queue
+    task_queue.enqueue(process_rag_file, rag_file.id)
     return _file_response(rag_file, 0)
 
 
@@ -151,7 +151,7 @@ async def add_link(
     db: AsyncSession = Depends(get_db),
 ):
     try:
-        url = validate_public_http_url(request.url)
+        url = await validate_public_http_url(str(request.url))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -171,7 +171,8 @@ async def add_link(
     await db.commit()
     await db.refresh(rag_file)
 
-    asyncio.create_task(process_rag_file(rag_file.id))
+    from core.task_queue import task_queue
+    task_queue.enqueue(process_rag_file, rag_file.id)
     return _file_response(rag_file, 0)
 
 

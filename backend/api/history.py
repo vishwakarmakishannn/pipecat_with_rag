@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import datetime
 
@@ -13,8 +13,8 @@ from services.memory import process_saved_message
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
 
 class MessageCreate(BaseModel):
-    role: str
-    content: str
+    role: str = Field(..., pattern=r"^(You|Aura)$")
+    content: str = Field(..., min_length=1, max_length=100000)
 
 class MessageResponse(BaseModel):
     id: int
@@ -26,7 +26,7 @@ class MessageResponse(BaseModel):
         from_attributes = True
 
 class ConversationCreate(BaseModel):
-    title: Optional[str] = "New conversation"
+    title: Optional[str] = Field("New conversation", max_length=255)
 
 class ConversationResponse(BaseModel):
     id: int

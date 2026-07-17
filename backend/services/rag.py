@@ -6,7 +6,7 @@ import os
 import re
 import socket
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -95,12 +95,7 @@ def is_rag_query(query: str) -> bool:
     return any(re.search(pattern, normalized) for pattern in RAG_QUERY_PATTERNS)
 
 
-def rag_storage_path(user_id: int, file_id: int) -> Path:
-    return Path(RAG_UPLOAD_DIR) / str(user_id) / f"{file_id}.pdf"
-
-
-def rag_link_storage_path(user_id: int, file_id: int) -> Path:
-    return Path(RAG_UPLOAD_DIR) / str(user_id) / f"{file_id}.md"
+# rag_storage_path and rag_link_storage_path removed as they are now handled by core.storage
 
 
 def _safe_filename(filename: str) -> str:
@@ -121,7 +116,7 @@ def _is_public_ip(ip_value: str) -> bool:
     return ip.is_global and not ip.is_multicast and not ip.is_reserved
 
 
-def validate_public_http_url(url: str) -> str:
+async def validate_public_http_url(url: str) -> str:
     raw_url = (url or "").strip()
     if "://" not in raw_url and "." in raw_url:
         raw_url = f"https://{raw_url}"
@@ -136,7 +131,8 @@ def validate_public_http_url(url: str) -> str:
         raise ValueError("Local links are not allowed")
 
     try:
-        infos = socket.getaddrinfo(hostname, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
+        loop = asyncio.get_running_loop()
+        infos = await loop.getaddrinfo(hostname, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
     except socket.gaierror as exc:
         raise ValueError("Could not resolve link hostname") from exc
 
@@ -346,7 +342,7 @@ async def _extract_link_with_crawl4ai(url: str) -> ExtractedLink:
     
     metadata = getattr(result, "metadata", None) or {}
     final_url = getattr(result, "url", None) or url
-    validate_public_http_url(final_url)
+    await validate_public_http_url(final_url)
     
     title = None
     site_name = None
@@ -362,26 +358,32 @@ async def _extract_link_with_crawl4ai(url: str) -> ExtractedLink:
     )
 
 
-def _fetch_html(url: str) -> tuple[str, str]:
+async def _fetch_html(url: str) -> tuple[str, str]:
     request = Request(url, headers={"User-Agent": RAG_LINK_USER_AGENT})
-    with urlopen(request, timeout=RAG_LINK_TIMEOUT_SECONDS) as response:
-        final_url = response.geturl()
-        validate_public_http_url(final_url)
-        content_type = response.headers.get("content-type", "")
-        if "text/html" not in content_type and "application/xhtml" not in content_type:
-            raise ValueError("Link did not return an HTML page")
-        data = response.read(RAG_LINK_MAX_BYTES + 1)
-        if len(data) > RAG_LINK_MAX_BYTES:
-            raise ValueError("Link content is too large")
-        charset = response.headers.get_content_charset() or "utf-8"
-    return data.decode(charset, errors="replace"), final_url
+    
+    def do_request():
+        with urlopen(request, timeout=RAG_LINK_TIMEOUT_SECONDS) as response:
+            final_url = response.geturl()
+            content_type = response.headers.get("content-type", "")
+            if "text/html" not in content_type and "application/xhtml" not in content_type:
+                raise ValueError("Link did not return an HTML page")
+            data = response.read(RAG_LINK_MAX_BYTES + 1)
+            if len(data) > RAG_LINK_MAX_BYTES:
+                raise ValueError("Link content is too large")
+            charset = response.headers.get_content_charset() or "utf-8"
+        return data.decode(charset, errors="replace"), final_url
+    
+    data, final_url = await asyncio.to_thread(do_request)
+    await validate_public_http_url(final_url)
+    return data, final_url
 
 
 async def _extract_link_with_trafilatura(url: str) -> ExtractedLink:
+    html, final_url = await _fetch_html(url)
+    
     def extract() -> ExtractedLink:
         import trafilatura
-
-        html, final_url = _fetch_html(url)
+        
         markdown = trafilatura.extract(
             html,
             url=final_url,
@@ -401,7 +403,7 @@ async def _extract_link_with_trafilatura(url: str) -> ExtractedLink:
 
 
 async def extract_link(url: str) -> ExtractedLink:
-    validated_url = await asyncio.to_thread(validate_public_http_url, url)
+    validated_url = await validate_public_http_url(url)
 
     errors = []
     if RAG_LINK_EXTRACTOR == "crawl4ai":
@@ -433,18 +435,17 @@ async def process_rag_file(file_id: int) -> None:
             return
 
         rag_file.status = "processing"
-        rag_file.error = None
-        rag_file.updated_at = datetime.utcnow()
+        rag_file.updated_at = datetime.now(timezone.utc)
         await db.commit()
 
         try:
             if rag_file.source_type == "link":
                 extracted = await extract_link(rag_file.url or rag_file.final_url or "")
                 markdown = extracted.markdown
-                storage_path = rag_link_storage_path(rag_file.user_id, rag_file.id)
-                Path(storage_path).parent.mkdir(parents=True, exist_ok=True)
-                storage_path.write_text(markdown, encoding="utf-8")
-                rag_file.storage_path = str(storage_path)
+                from core.storage import storage_client
+                object_name = f"{rag_file.user_id}/{rag_file.id}.md"
+                storage_path = await storage_client.upload_file(markdown.encode("utf-8"), object_name)
+                rag_file.storage_path = storage_path
                 rag_file.final_url = extracted.final_url
                 rag_file.title = extracted.title or rag_file.title
                 rag_file.site_name = extracted.site_name or _hostname_label(extracted.final_url)
@@ -454,7 +455,17 @@ async def process_rag_file(file_id: int) -> None:
                 rag_file.content_hash = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
                 parsed_chunks = chunk_link_markdown(markdown, rag_file.title, extracted.final_url)
             else:
-                parsed_chunks = await asyncio.to_thread(_parse_pdf_to_chunks, rag_file.storage_path)
+                import tempfile
+                import os
+                from core.storage import storage_client
+                fd, temp_path = tempfile.mkstemp(suffix=".pdf")
+                os.close(fd)
+                try:
+                    object_name = rag_file.storage_path if self_hosted_url_hack(rag_file.storage_path) else "/".join(rag_file.storage_path.split("/")[-2:])
+                    await storage_client.download_file(object_name, temp_path)
+                    parsed_chunks = await asyncio.to_thread(_parse_pdf_to_chunks, temp_path)
+                finally:
+                    os.unlink(temp_path)
             if not parsed_chunks:
                 raise ValueError("No usable text chunks found")
 
@@ -477,14 +488,14 @@ async def process_rag_file(file_id: int) -> None:
 
             rag_file.status = "ready"
             rag_file.error = None
-            rag_file.updated_at = datetime.utcnow()
+            rag_file.updated_at = datetime.now(timezone.utc)
             await db.commit()
             logger.info(f"Processed RAG source {rag_file.id} with {len(parsed_chunks)} chunks")
         except Exception as exc:
             logger.warning(f"RAG source processing failed for source={file_id}: {exc}")
             rag_file.status = "failed"
             rag_file.error = str(exc)[:2000]
-            rag_file.updated_at = datetime.utcnow()
+            rag_file.updated_at = datetime.now(timezone.utc)
             await db.commit()
 
 
@@ -493,10 +504,12 @@ async def delete_rag_file_record(rag_file: RagFile, db) -> None:
     await db.delete(rag_file)
     await db.commit()
     if storage_path:
-        try:
-            Path(storage_path).unlink(missing_ok=True)
-        except Exception as exc:
-            logger.warning(f"Could not delete RAG file from disk: {exc}")
+        from core.storage import storage_client
+        object_name = storage_path if storage_path.startswith("local://") else "/".join(storage_path.split("/")[-2:])
+        await storage_client.delete_file(object_name)
+
+def self_hosted_url_hack(storage_path: str) -> bool:
+    return storage_path.startswith("local://")
 
 
 def _rrf(rank: int) -> float:
@@ -590,8 +603,11 @@ async def retrieve_rag_chunks(
                     value for value in [item["vector_similarity"], similarity] if value is not None
                 ) if item["vector_similarity"] is not None or similarity is not None else None
                 item["source_types"].add("vector")
-
-        ts_query = func.websearch_to_tsquery(literal_column("'english'"), query)
+        # Convert conversational query to an OR search for better FTS recall
+        or_query = " OR ".join(w for w in re.split(r'\s+', query) if w)
+        if not or_query:
+            or_query = query
+        ts_query = func.websearch_to_tsquery(literal_column("'english'"), or_query)
         text_rank = func.ts_rank_cd(RagChunk.search_vector, ts_query).label("text_rank")
         text_result = await db.execute(
             select(RagChunk, RagFile, text_rank)

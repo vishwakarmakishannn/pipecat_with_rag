@@ -64,131 +64,11 @@ from tools.raise_issue import raise_issue
 
 load_dotenv(override=True)
 
-
-class ConversationMemoryProcessor(FrameProcessor):
-    def __init__(self, conversation_id: int | None, capture: str, **kwargs):
-        super().__init__(**kwargs)
-        self._conversation_id = conversation_id
-        self._capture = capture
-        self._assistant_chunks: list[str] = []
-
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
-
-        if (
-            direction == FrameDirection.DOWNSTREAM
-            and self._capture == "user"
-            and isinstance(frame, TranscriptionFrame)
-        ):
-            asyncio.create_task(save_conversation_message(self._conversation_id, "You", frame.text))
-        elif (
-            direction == FrameDirection.DOWNSTREAM
-            and self._capture == "assistant"
-            and isinstance(frame, LLMTextFrame)
-        ):
-            self._assistant_chunks.append(frame.text)
-        elif (
-            direction == FrameDirection.DOWNSTREAM
-            and self._capture == "assistant"
-            and isinstance(frame, LLMFullResponseEndFrame)
-        ):
-            assistant_text = "".join(self._assistant_chunks).strip()
-            self._assistant_chunks.clear()
-            asyncio.create_task(save_conversation_message(self._conversation_id, "Aura", assistant_text))
-
-        await self.push_frame(frame, direction)
-
-
-class ToolFillerProcessor(FrameProcessor):
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
-
-        if direction == FrameDirection.DOWNSTREAM and isinstance(frame, FunctionCallInProgressFrame):
-            await self.push_frame(TTSSpeakFrame("Let me look that up for you.", append_to_context=False), direction)
-
-        await self.push_frame(frame, direction)
-
-
-class RollingVoiceQueryBuffer:
-    def __init__(self, window_seconds: float = RAG_VOICE_QUERY_WINDOW_SECONDS):
-        self._window_seconds = window_seconds
-        self._items: list[tuple[float, str]] = []
-
-    def add(self, text: str, now: float | None = None) -> str:
-        now = time.monotonic() if now is None else now
-        text = (text or "").strip()
-        if text:
-            self._items.append((now, text))
-        self._items = [
-            (timestamp, value)
-            for timestamp, value in self._items
-            if now - timestamp <= self._window_seconds
-        ]
-        return " ".join(value for _, value in self._items)
-
-    def clear(self) -> None:
-        self._items.clear()
-
-
-class ContextRetrievalProcessor(FrameProcessor):
-    def __init__(
-        self,
-        user_id: int | None,
-        conversation_id: int | None,
-        context: LLMContext,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-        self._user_id = user_id
-        self._conversation_id = conversation_id
-        self._context = context
-        self._query_buffer = RollingVoiceQueryBuffer()
-
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
-
-        if (
-            direction == FrameDirection.DOWNSTREAM
-            and self._user_id
-            and isinstance(frame, TranscriptionFrame)
-        ):
-            combined_query = self._query_buffer.add(frame.text)
-            
-            if is_rag_query(frame.text):
-                await self.push_frame(TTSSpeakFrame("Let me look that up for you.", append_to_context=False), direction)
-            
-            memory_task = asyncio.create_task(build_turn_memory_context(self._user_id, frame.text))
-            rag_task = asyncio.create_task(build_rag_context_with_payload(self._user_id, combined_query))
-            
-            memory_context, (rag_context, rag_payload) = await asyncio.gather(memory_task, rag_task)
-            
-            if memory_context:
-                self._context.add_message({"role": "developer", "content": memory_context})
-            if rag_context:
-                self._context.add_message({"role": "developer", "content": rag_context})
-            if rag_payload:
-                asyncio.create_task(save_conversation_message(
-                    self._conversation_id,
-                    "RagCall",
-                    json.dumps(rag_payload),
-                ))
-                await self.push_frame(
-                    OutputTransportMessageFrame(
-                        {
-                            "label": "rtvi-ai",
-                            "type": "server-message",
-                            "data": {
-                                "type": "rag_call",
-                                "payload": rag_payload,
-                            },
-                        }
-                    ),
-                    direction,
-                )
-        elif direction == FrameDirection.DOWNSTREAM and isinstance(frame, LLMFullResponseEndFrame):
-            self._query_buffer.clear()
-
-        await self.push_frame(frame, direction)
+from core.processors import (
+    ConversationMemoryProcessor,
+    ToolFillerProcessor,
+    ContextRetrievalProcessor,
+)
 
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> None:
@@ -318,135 +198,56 @@ async def bot(runner_args: RunnerArguments):
     await run_bot(transport, runner_args)
 
 
+from fastapi import APIRouter
+health_router = APIRouter(tags=["health"])
+
+@health_router.get("/health/live")
+async def liveness_probe():
+    return {"status": "alive"}
+
+@health_router.get("/health/ready")
+async def readiness_probe():
+    # In a real app, you might check DB connectivity here
+    return {"status": "ready"}
+
+
+
 if __name__ == "__main__":
     from pipecat.runner.run import app, main
+    from fastapi.middleware.cors import CORSMiddleware
+    import os
+
+    allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:80")
+    allowed_origins = [origin.strip() for origin in allowed_origins_str.split(",")]
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
     from api.auth import router as auth_router
     from api.history import router as history_router
     from api.memories import router as memories_router
     from api.rag_files import router as rag_files_router
     
-    # Mount the authentication routes
     app.include_router(auth_router)
     app.include_router(history_router)
     app.include_router(memories_router)
     app.include_router(rag_files_router)
+    app.include_router(health_router)
     
     from contextlib import asynccontextmanager
     
-    # Initialize the database and eagerly load models on startup
+    # Initialize the background task queue
     @asynccontextmanager
     async def lifespan(app):
-        from core.database import engine, Base
-        async with engine.begin() as conn:
-            from sqlalchemy import text
-            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-            await conn.run_sync(Base.metadata.create_all)
-            await conn.execute(text("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS summary TEXT DEFAULT ''"))
-            await conn.execute(text("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
-            await conn.execute(text("UPDATE conversations SET updated_at = created_at WHERE updated_at IS NULL"))
-            await conn.execute(text("ALTER TABLE user_memories ADD COLUMN IF NOT EXISTS fact_type VARCHAR DEFAULT 'profile' NOT NULL"))
-            await conn.execute(text("ALTER TABLE user_memories ADD COLUMN IF NOT EXISTS durability VARCHAR DEFAULT 'stable' NOT NULL"))
-            await conn.execute(text("ALTER TABLE user_memories ADD COLUMN IF NOT EXISTS status VARCHAR DEFAULT 'active' NOT NULL"))
-            await conn.execute(text("UPDATE user_memories SET fact_type = 'profile' WHERE fact_type IS NULL"))
-            await conn.execute(text("UPDATE user_memories SET durability = 'stable' WHERE durability IS NULL"))
-            await conn.execute(text("UPDATE user_memories SET status = 'active' WHERE status IS NULL"))
-            await conn.execute(text("UPDATE user_memories SET key = 'real_name' WHERE key = 'name'"))
-            await conn.execute(text("ALTER TABLE user_memories DROP CONSTRAINT IF EXISTS uq_user_memory_key"))
-            await conn.execute(text("ALTER TABLE rag_files ADD COLUMN IF NOT EXISTS source_type VARCHAR DEFAULT 'pdf' NOT NULL"))
-            await conn.execute(text("ALTER TABLE rag_files ADD COLUMN IF NOT EXISTS url TEXT"))
-            await conn.execute(text("ALTER TABLE rag_files ADD COLUMN IF NOT EXISTS final_url TEXT"))
-            await conn.execute(text("ALTER TABLE rag_files ADD COLUMN IF NOT EXISTS title TEXT"))
-            await conn.execute(text("ALTER TABLE rag_files ADD COLUMN IF NOT EXISTS site_name TEXT"))
-            await conn.execute(text("ALTER TABLE rag_files ADD COLUMN IF NOT EXISTS content_hash VARCHAR"))
-            await conn.execute(text("UPDATE rag_files SET source_type = 'pdf' WHERE source_type IS NULL"))
-            await conn.execute(text(
-                """
-                DO $$
-                BEGIN
-                    IF NOT EXISTS (
-                        SELECT 1
-                        FROM pg_constraint
-                        WHERE conname = 'uq_user_memory_fact_value'
-                    ) THEN
-                        ALTER TABLE user_memories
-                        ADD CONSTRAINT uq_user_memory_fact_value
-                        UNIQUE (user_id, fact_type, key, value);
-                    END IF;
-                END $$;
-                """
-            ))
-            try:
-                await conn.execute(text("DROP INDEX IF EXISTS idx_memory_chunks_embedding"))
-                await conn.execute(text(
-                    f"""
-                    UPDATE memory_chunks
-                    SET embedding = NULL
-                    WHERE embedding IS NOT NULL
-                      AND vector_dims(embedding) != {MEMORY_EMBEDDING_DIMENSION}
-                    """
-                ))
-                await conn.execute(text(
-                    f"""
-                    ALTER TABLE memory_chunks
-                    ALTER COLUMN embedding TYPE vector({MEMORY_EMBEDDING_DIMENSION})
-                    USING embedding::vector({MEMORY_EMBEDDING_DIMENSION})
-                    """
-                ))
-                await conn.execute(text(
-                    "CREATE INDEX IF NOT EXISTS idx_memory_chunks_embedding "
-                    "ON memory_chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)"
-                ))
-            except Exception as exc:
-                logger.warning(
-                    "pgvector setup skipped. Ensure the Postgres container uses "
-                    "pgvector/pgvector:pg15 and MEMORY_EMBEDDING_DIMENSION matches "
-                    f"your embedding provider. Error: {exc}"
-                )
-            try:
-                await conn.execute(text(
-                    f"""
-                    UPDATE rag_chunks
-                    SET embedding = NULL
-                    WHERE embedding IS NOT NULL
-                      AND vector_dims(embedding) != {MEMORY_EMBEDDING_DIMENSION}
-                    """
-                ))
-                await conn.execute(text(
-                    f"""
-                    ALTER TABLE rag_chunks
-                    ALTER COLUMN embedding TYPE vector({MEMORY_EMBEDDING_DIMENSION})
-                    USING embedding::vector({MEMORY_EMBEDDING_DIMENSION})
-                    """
-                ))
-                await conn.execute(text(
-                    "CREATE INDEX IF NOT EXISTS idx_rag_chunks_embedding "
-                    "ON rag_chunks USING hnsw (embedding vector_cosine_ops)"
-                ))
-                await conn.execute(text(
-                    "CREATE INDEX IF NOT EXISTS idx_rag_chunks_search_vector "
-                    "ON rag_chunks USING GIN (search_vector)"
-                ))
-                await conn.execute(text(
-                    "CREATE INDEX IF NOT EXISTS idx_rag_files_user_status "
-                    "ON rag_files (user_id, status)"
-                ))
-                await conn.execute(text(
-                    "CREATE INDEX IF NOT EXISTS idx_rag_chunks_user_file "
-                    "ON rag_chunks (user_id, file_id)"
-                ))
-            except Exception as exc:
-                logger.warning(f"RAG index setup skipped: {exc}")
-                
-        # Eagerly load the embedding model to avoid latency on first use
-        try:
-            from services.memory import _get_embedding_model_async
-            logger.info("Eagerly loading embedding model at startup...")
-            await _get_embedding_model_async()
-            logger.info("Embedding model loaded successfully.")
-        except Exception as exc:
-            logger.error(f"Failed to load embedding model at startup: {exc}")
-            
+        from core.task_queue import task_queue
+        task_queue.start(num_workers=3)
         yield
+        await task_queue.stop()
 
     app.router.lifespan_context = lifespan
 

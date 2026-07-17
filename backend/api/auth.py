@@ -6,12 +6,15 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 import bcrypt
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
+import re
 
 from core.database import get_db
 from core.models import User
 
-SECRET_KEY = os.getenv("JWT_SECRET", "supersecret-aura-voice-key")
+SECRET_KEY = os.getenv("JWT_SECRET")
+if not SECRET_KEY:
+    raise ValueError("JWT_SECRET environment variable is not set")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7 # 7 days
 
@@ -19,8 +22,19 @@ security = HTTPBearer()
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 class UserCreate(BaseModel):
-    username: str
-    password: str
+    username: str = Field(..., min_length=3, max_length=50, pattern=r"^[a-zA-Z0-9_]+$")
+    password: str = Field(..., min_length=8, max_length=100)
+
+    @field_validator('password')
+    @classmethod
+    def validate_password(cls, v):
+        if not re.search(r"[A-Z]", v):
+            raise ValueError("Password must contain at least one uppercase letter")
+        if not re.search(r"[a-z]", v):
+            raise ValueError("Password must contain at least one lowercase letter")
+        if not re.search(r"[0-9]", v):
+            raise ValueError("Password must contain at least one digit")
+        return v
 
 class UserResponse(BaseModel):
     id: int

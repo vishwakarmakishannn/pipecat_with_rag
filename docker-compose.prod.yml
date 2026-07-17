@@ -1,14 +1,12 @@
 services:
   db:
     image: pgvector/pgvector:pg15
-    container_name: pipecat_db
+    container_name: pipecat_db_prod
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-pipecat_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pipecat_password}
       POSTGRES_DB: ${POSTGRES_DB:-pipecat_db}
-    # Expose port so local 'uv run main.py' can still connect during development!
-    ports:
-      - "5434:5432"
+    # Do not expose ports to the host machine in production, let backend connect via docker network
     volumes:
       - pgdata:/var/lib/postgresql/data
     restart: unless-stopped
@@ -17,24 +15,25 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: pipecat_backend
+    container_name: pipecat_backend_prod
     depends_on:
       - db
     environment:
-      # In Docker, we connect to 'db:5432' instead of 'localhost:5434'
       - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-pipecat_user}:${POSTGRES_PASSWORD:-pipecat_password}@db:5432/${POSTGRES_DB:-pipecat_db}
+      - JWT_SECRET=${JWT_SECRET}
+      # Add other keys from .env
     env_file:
       - .env
     # Exposing the backend port internally or via reverse proxy
-    ports:
-      - "7860:7860"
+    expose:
+      - 7860
     restart: unless-stopped
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-    container_name: pipecat_frontend
+    container_name: pipecat_frontend_prod
     ports:
       - "8080:80"
     depends_on:

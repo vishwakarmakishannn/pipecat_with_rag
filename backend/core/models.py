@@ -1,10 +1,13 @@
-from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, Index
 from sqlalchemy.dialects.postgresql import TSVECTOR
 from sqlalchemy.orm import relationship
 from pgvector.sqlalchemy import Vector
-from datetime import datetime
+from datetime import datetime, timezone
 from core.database import Base
 from core.memory_config import MEMORY_EMBEDDING_DIMENSION
+
+def utcnow():
+    return datetime.now(timezone.utc)
 
 class User(Base):
     __tablename__ = "users"
@@ -22,12 +25,16 @@ class User(Base):
 class Conversation(Base):
     __tablename__ = "conversations"
 
+    __table_args__ = (
+        Index("idx_conversation_user_updated", "user_id", "updated_at"),
+    )
+
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     title = Column(String, default="New conversation")
     summary = Column(Text, nullable=True, default="")
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
     user = relationship("User", back_populates="conversations")
     messages = relationship("Message", back_populates="conversation", cascade="all, delete-orphan")
@@ -36,17 +43,24 @@ class Conversation(Base):
 class Message(Base):
     __tablename__ = "messages"
 
+    __table_args__ = (
+        Index("idx_message_conversation_created", "conversation_id", "created_at"),
+    )
+
     id = Column(Integer, primary_key=True, index=True)
     conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False)
     role = Column(String, nullable=False)  # 'You' or 'Aura'
     content = Column(String, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
 
     conversation = relationship("Conversation", back_populates="messages")
 
 class UserMemory(Base):
     __tablename__ = "user_memories"
-    __table_args__ = (UniqueConstraint("user_id", "fact_type", "key", "value", name="uq_user_memory_fact_value"),)
+    __table_args__ = (
+        UniqueConstraint("user_id", "fact_type", "key", "value", name="uq_user_memory_fact_value"),
+        Index("idx_user_memory_user_updated", "user_id", "updated_at"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
@@ -57,14 +71,16 @@ class UserMemory(Base):
     durability = Column(String, default="stable", nullable=False)
     status = Column(String, default="active", nullable=False)
     source_message_id = Column(Integer, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
     user = relationship("User", back_populates="memories")
 
 class MemoryChunk(Base):
     __tablename__ = "memory_chunks"
-    __table_args__ = (UniqueConstraint("conversation_id", "message_start_id", "message_end_id", name="uq_memory_chunk_message_window"),)
+    __table_args__ = (
+        UniqueConstraint("conversation_id", "message_start_id", "message_end_id", name="uq_memory_chunk_message_window"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
@@ -74,8 +90,8 @@ class MemoryChunk(Base):
     chunk_text = Column(Text, nullable=False)
     summary = Column(Text, nullable=True)
     embedding = Column(Vector(MEMORY_EMBEDDING_DIMENSION), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
     user = relationship("User", back_populates="memory_chunks")
     conversation = relationship("Conversation", back_populates="memory_chunks")
@@ -98,8 +114,8 @@ class RagFile(Base):
     size_bytes = Column(Integer, nullable=False, default=0)
     status = Column(String, nullable=False, default="processing")
     error = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
     user = relationship("User", back_populates="rag_files")
     chunks = relationship("RagChunk", back_populates="file", cascade="all, delete-orphan")
@@ -119,8 +135,8 @@ class RagChunk(Base):
     content = Column(Text, nullable=False)
     embedding = Column(Vector(MEMORY_EMBEDDING_DIMENSION), nullable=True)
     search_vector = Column(TSVECTOR, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
     user = relationship("User", back_populates="rag_chunks")
     file = relationship("RagFile", back_populates="chunks")
@@ -136,5 +152,5 @@ class Issue(Base):
     device_id = Column(String, nullable=False)
     description = Column(Text, nullable=False)
     status = Column(String, nullable=False, default="raised")
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

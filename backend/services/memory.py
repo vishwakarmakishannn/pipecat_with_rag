@@ -3,7 +3,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import jwt
@@ -29,6 +29,7 @@ from core.memory_config import (
     SUMMARY_MESSAGE_THRESHOLD,
 )
 from core.models import Conversation, MemoryChunk, Message, User, UserMemory
+from core.prompt_config import load_memory_prompt
 
 
 SINGLE_VALUE_KEYS = {"real_name", "preferred_name", "location", "role", "preferred_language"}
@@ -327,35 +328,25 @@ async def _generate_text_with_memory_llm(prompt: str) -> str | None:
         api_key = os.getenv("GOOGLE_API_KEY")
         if not api_key:
             return None
-
-        def call_google():
-            from google import genai
-
-            client = genai.Client(api_key=api_key)
-            response = client.models.generate_content(
-                model=os.getenv("GOOGLE_MEMORY_MODEL", os.getenv("GOOGLE_MODEL", "gemini-3.1-flash-lite")),
-                contents=prompt,
-            )
-            return getattr(response, "text", None)
-
-        return await asyncio.to_thread(call_google)
+        from google import genai
+        client = genai.Client(api_key=api_key)
+        response = await client.aio.models.generate_content(
+            model=os.getenv("GOOGLE_MEMORY_MODEL", os.getenv("GOOGLE_MODEL", "gemini-2.5-flash")),
+            contents=prompt,
+        )
+        return getattr(response, "text", None)
 
     async def generate_openai() -> str | None:
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             return None
-
-        def call_openai():
-            from openai import OpenAI
-
-            client = OpenAI(api_key=api_key)
-            response = client.responses.create(
-                model=os.getenv("OPENAI_MEMORY_MODEL", os.getenv("OPENAI_MODEL", "gpt-4.1-mini")),
-                input=prompt,
-            )
-            return getattr(response, "output_text", None)
-
-        return await asyncio.to_thread(call_openai)
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=api_key)
+        response = await client.chat.completions.create(
+            model=os.getenv("OPENAI_MEMORY_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini")),
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.choices[0].message.content
 
     generators = [generate_google, generate_openai]
     if provider != "google":
@@ -370,22 +361,6 @@ async def _generate_text_with_memory_llm(prompt: str) -> str | None:
 
 
 _embedding_model = None
-_embedding_lock = asyncio.Lock()
-
-async def _get_embedding_model_async():
-    global _embedding_model
-    if _embedding_model is None:
-        async with _embedding_lock:
-            if _embedding_model is None:
-                def load_model():
-                    from sentence_transformers import SentenceTransformer
-                    logger.info("Loading offline embedding model BAAI/bge-base-en-v1.5...")
-                    return SentenceTransformer("BAAI/bge-base-en-v1.5")
-                _embedding_model = await asyncio.to_thread(load_model)
-                logger.info("Offline embedding model loaded.")
-    return _embedding_model
-
-
 async def embed_text(value: str) -> list[float] | None:
     value = (value or "").strip()
     if not value or MEMORY_VECTOR_DB != "pgvector":
@@ -402,20 +377,40 @@ async def embed_text(value: str) -> list[float] | None:
             return None
         return embedding
 
-    # Load model outside the timeout block so the initial download doesn't time out
-    model = await _get_embedding_model_async()
+    provider = os.getenv("MEMORY_EMBEDDING_PROVIDER", "google").lower()
 
-    async def embed_local() -> list[float] | None:
-        def call_local():
-            embedding = model.encode(value, normalize_embeddings=True)
-            return normalize_embedding(embedding.tolist(), "Local")
+    async def embed_google() -> list[float] | None:
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if not api_key: return None
+        from google import genai
+        from google.genai import types
+        client = genai.Client(api_key=api_key)
+        model = os.getenv("GOOGLE_EMBEDDING_MODEL", "gemini-embedding-001")
+        response = await client.aio.models.embed_content(
+            model=model,
+            contents=value,
+            config=types.EmbedContentConfig(output_dimensionality=MEMORY_EMBEDDING_DIMENSION)
+        )
+        return normalize_embedding(response.embeddings[0].values, "Google")
 
-        return await asyncio.to_thread(call_local)
+    async def embed_openai() -> list[float] | None:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key: return None
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=api_key)
+        model = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+        response = await client.embeddings.create(input=value, model=model)
+        return normalize_embedding(response.data[0].embedding, "OpenAI")
 
-    try:
-        return await asyncio.wait_for(embed_local(), timeout=MEMORY_LLM_TIMEOUT_SECONDS * 5)
-    except Exception as exc:
-        logger.warning(f"Embedding call failed: {exc}")
+    generators = [embed_google, embed_openai]
+    if provider != "google":
+        generators.reverse()
+
+    for generator in generators:
+        try:
+            return await asyncio.wait_for(generator(), timeout=MEMORY_LLM_TIMEOUT_SECONDS * 5)
+        except Exception as exc:
+            logger.warning(f"Embedding call failed: {exc}")
     return None
 
 
@@ -502,16 +497,9 @@ def _valid_fact_event(event: dict[str, Any]) -> dict[str, Any] | None:
 
 
 async def classify_memory_events(user_text: str, assistant_text: str | None = None) -> list[dict[str, Any]]:
+    base_prompt = load_memory_prompt()
     prompt = (
-        "You classify durable user memory from a voice conversation turn. Return strict JSON only.\n"
-        "CRITICAL RULES:\n"
-        "1. ONLY extract facts about the speaker (the user). Ignore any names, roles, or facts about third parties or other people mentioned.\n"
-        "2. If the user is asking a question or looking up information, do NOT extract memory (return empty events).\n"
-        "3. Do not infer. Do not store temporary states like 'I'm fine'.\n"
-        "Use keys: real_name, preferred_name, location, role, preferred_language, likes, dislikes, interests, goals.\n"
-        "Single-value keys overwrite only their same key. Multi-value keys append. Use deactivate when the user retracts a fact.\n\n"
-        "Schema: {\"events\":[{\"action\":\"upsert|deactivate|ignore\",\"fact_type\":\"profile|preference|goal\","
-        "\"key\":\"string\",\"value\":\"string\",\"confidence\":0.0,\"durability\":\"stable|temporary\"}]}\n\n"
+        f"{base_prompt}\n\n"
         f"User: {user_text}\n"
         f"Assistant: {assistant_text or ''}"
     )
@@ -533,7 +521,7 @@ async def apply_fact_events(
     if not events:
         return
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     for event in events:
         key = event["key"]
         value = event["value"]
@@ -633,7 +621,7 @@ async def store_memory_chunk(
     if not embedding:
         return None
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     stmt = insert(MemoryChunk).values(
         user_id=conversation.user_id,
         conversation_id=conversation.id,
@@ -756,25 +744,6 @@ async def update_conversation_summary_if_needed(db: AsyncSession, conversation: 
         await store_memory_chunk(db, conversation, messages[-8:])
 
 
-async def process_saved_message(
-    db: AsyncSession,
-    conversation: Conversation,
-    message: Message,
-) -> None:
-    conversation.updated_at = datetime.utcnow()
-
-    if conversation.title == "New conversation" and message.role == "You":
-        new_title = " ".join(message.content.split()[:4])
-        conversation.title = new_title or conversation.title
-
-    if message.role == "You":
-        events = await classify_memory_events(message.content)
-        await apply_fact_events(db, conversation.user_id, events, message.id)
-
-    if message.role in {"You", "Aura"}:
-        await update_conversation_summary_if_needed(db, conversation)
-
-
 async def save_conversation_message(
     conversation_id: int | None,
     role: str,
@@ -793,8 +762,38 @@ async def save_conversation_message(
 
         message = Message(conversation_id=conversation_id, role=role, content=content)
         db.add(message)
-        await db.flush()
-        await process_saved_message(db, conversation, message)
+        
+        # We need to update conversation title/updated_at here before commit
+        conversation.updated_at = datetime.now(timezone.utc)
+        if conversation.title == "New conversation" and message.role == "You":
+            new_title = " ".join(message.content.split()[:4])
+            conversation.title = new_title or conversation.title
+            
         await db.commit()
         await db.refresh(message)
-        return message
+        
+    from core.task_queue import task_queue
+    task_queue.enqueue(_process_saved_message_background, conversation_id, message.id)
+    return message
+
+
+async def _process_saved_message_background(conversation_id: int, message_id: int):
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(Conversation).where(Conversation.id == conversation_id))
+        conversation = result.scalars().first()
+        msg_result = await db.execute(select(Message).where(Message.id == message_id))
+        message = msg_result.scalars().first()
+        
+        if conversation and message:
+            if message.role == "You":
+                events = await classify_memory_events(message.content)
+                await apply_fact_events(db, conversation.user_id, events, message.id)
+        
+            if message.role in {"You", "Aura"}:
+                await update_conversation_summary_if_needed(db, conversation)
+            
+            await db.commit()
+
+async def process_saved_message(db: AsyncSession, conversation: Conversation, message: Message) -> None:
+    from core.task_queue import task_queue
+    task_queue.enqueue(_process_saved_message_background, conversation.id, message.id)

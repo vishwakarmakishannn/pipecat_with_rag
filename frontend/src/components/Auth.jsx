@@ -1,8 +1,7 @@
 import { useState } from 'react';
 import { User, Lock, ArrowRight, UserPlus } from 'lucide-react';
+import { API_BASE } from '../utils/api';
 import './Auth.css';
-
-const API_BASE = `${window.location.protocol}//${window.location.hostname}:7860`;
 
 export default function Auth({ onLogin }) {
   const [isLogin, setIsLogin] = useState(true);

@@ -10,12 +10,14 @@ import {
   VoiceVisualizer,
 } from '@pipecat-ai/client-react';
 import { SmallWebRTCTransport } from '@pipecat-ai/small-webrtc-transport';
-import { Plus, Mic, Volume2, X, User, MessageSquare, LogOut, Trash2, Wrench, ChevronDown, ChevronRight, Brain, FileText, Upload, RefreshCw, Link as LinkIcon } from 'lucide-react';
+import { Mic, Volume2, X } from 'lucide-react';
 import { jwtDecode } from 'jwt-decode';
 import Auth from './components/Auth';
+import Sidebar from './components/Sidebar';
+import TranscriptPanel from './components/TranscriptPanel';
+import { fetchWithAuth, API_BASE } from './utils/api';
 import './App.css';
 
-const API_BASE = `${window.location.protocol}//${window.location.hostname}:7860`;
 const START_ENDPOINT =
   import.meta.env.VITE_PIPECAT_START_URL ||
   `${API_BASE}/start`;
@@ -42,15 +44,19 @@ function VoiceApp({ onResetClient }) {
   const pcClient = usePipecatClient();
   const transportState = usePipecatClientTransportState();
   const { enableMic, isMicEnabled } = usePipecatClientMicControl();
+  
   const [isConnecting, setIsConnecting] = useState(false);
   const [error, setError] = useState('');
+  
   const [transcripts, setTranscripts] = useState([]);
   const [conversations, setConversations] = useState([]);
   const [currentConversationId, setCurrentConversationId] = useState(null);
+  
   const [memories, setMemories] = useState([]);
   const [isMemoryPanelOpen, setIsMemoryPanelOpen] = useState(false);
   const [isMemoryLoading, setIsMemoryLoading] = useState(false);
   const [memoryError, setMemoryError] = useState('');
+  
   const [sidebarTab, setSidebarTab] = useState('chats');
   const [ragFiles, setRagFiles] = useState([]);
   const [isFilesLoading, setIsFilesLoading] = useState(false);
@@ -58,14 +64,17 @@ function VoiceApp({ onResetClient }) {
   const [isAddingLink, setIsAddingLink] = useState(false);
   const [linkUrl, setLinkUrl] = useState('');
   const [fileError, setFileError] = useState('');
+  
   const currentConversationIdRef = React.useRef(null);
   const transcriptAreaRef = React.useRef(null);
   const transcriptBottomRef = React.useRef(null);
   const shouldAutoScrollRef = React.useRef(true);
+  
   const botTextRef = React.useRef('');
   const activeBotMessageIdRef = React.useRef(null);
   const toolCallPayloadsRef = React.useRef({});
   const savedToolCallIdsRef = React.useRef(new Set());
+  
   const [expandedToolCalls, setExpandedToolCalls] = useState({});
 
   const toggleToolCall = (id) => {
@@ -83,9 +92,7 @@ function VoiceApp({ onResetClient }) {
 
   const fetchConversations = useCallback(async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/conversations`, {
-        headers: { Authorization: `Bearer ${localStorage.getItem('aura_token')}` }
-      });
+      const res = await fetchWithAuth(`/api/conversations`);
       if (res.ok) setConversations(await res.json());
     } catch (err) {
       console.warn('Failed to fetch conversations', err);
@@ -96,9 +103,7 @@ function VoiceApp({ onResetClient }) {
     setIsMemoryLoading(true);
     setMemoryError('');
     try {
-      const res = await fetch(`${API_BASE}/api/memories`, {
-        headers: { Authorization: `Bearer ${localStorage.getItem('aura_token')}` }
-      });
+      const res = await fetchWithAuth(`/api/memories`);
       if (!res.ok) throw new Error('Could not load memories');
       setMemories(await res.json());
     } catch (err) {
@@ -112,9 +117,7 @@ function VoiceApp({ onResetClient }) {
     setIsFilesLoading(true);
     setFileError('');
     try {
-      const res = await fetch(`${API_BASE}/api/files`, {
-        headers: { Authorization: `Bearer ${localStorage.getItem('aura_token')}` }
-      });
+      const res = await fetchWithAuth(`/api/files`);
       if (!res.ok) throw new Error('Could not load files');
       setRagFiles(await res.json());
     } catch (err) {
@@ -160,9 +163,7 @@ function VoiceApp({ onResetClient }) {
     currentConversationIdRef.current = id;
     setCurrentConversationId(id);
     try {
-      const res = await fetch(`${API_BASE}/api/conversations/${id}/messages`, {
-        headers: { Authorization: `Bearer ${localStorage.getItem('aura_token')}` }
-      });
+      const res = await fetchWithAuth(`/api/conversations/${id}/messages`);
       if (res.ok) {
         const msgs = await res.json();
         setTranscripts(msgs.map(m => ({
@@ -180,9 +181,8 @@ function VoiceApp({ onResetClient }) {
   const deleteConversation = async (e, id) => {
     e.stopPropagation();
     try {
-      const res = await fetch(`${API_BASE}/api/conversations/${id}`, {
-        method: 'DELETE',
-        headers: { Authorization: `Bearer ${localStorage.getItem('aura_token')}` }
+      const res = await fetchWithAuth(`/api/conversations/${id}`, {
+        method: 'DELETE'
       });
       if (res.ok) {
         if (currentConversationId === id) {
@@ -205,9 +205,8 @@ function VoiceApp({ onResetClient }) {
 
   const deleteMemory = async (id) => {
     try {
-      const res = await fetch(`${API_BASE}/api/memories/${id}`, {
-        method: 'DELETE',
-        headers: { Authorization: `Bearer ${localStorage.getItem('aura_token')}` }
+      const res = await fetchWithAuth(`/api/memories/${id}`, {
+        method: 'DELETE'
       });
       if (!res.ok) throw new Error('Could not delete memory');
       setMemories((items) => items.filter((memory) => memory.id !== id));
@@ -218,9 +217,8 @@ function VoiceApp({ onResetClient }) {
 
   const deleteAllMemories = async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/memories`, {
-        method: 'DELETE',
-        headers: { Authorization: `Bearer ${localStorage.getItem('aura_token')}` }
+      const res = await fetchWithAuth(`/api/memories`, {
+        method: 'DELETE'
       });
       if (!res.ok) throw new Error('Could not delete memories');
       setMemories([]);
@@ -239,9 +237,8 @@ function VoiceApp({ onResetClient }) {
     try {
       const formData = new FormData();
       formData.append('file', file);
-      const res = await fetch(`${API_BASE}/api/files`, {
+      const res = await fetchWithAuth(`/api/files`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${localStorage.getItem('aura_token')}` },
         body: formData,
       });
       if (!res.ok) {
@@ -264,11 +261,10 @@ function VoiceApp({ onResetClient }) {
     setIsAddingLink(true);
     setFileError('');
     try {
-      const res = await fetch(`${API_BASE}/api/files/link`, {
+      const res = await fetchWithAuth(`/api/files/link`, {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${localStorage.getItem('aura_token')}`
+          'Content-Type': 'application/json'
         },
         body: JSON.stringify({ url })
       });
@@ -287,37 +283,14 @@ function VoiceApp({ onResetClient }) {
 
   const deleteRagFile = async (id) => {
     try {
-      const res = await fetch(`${API_BASE}/api/files/${id}`, {
-        method: 'DELETE',
-        headers: { Authorization: `Bearer ${localStorage.getItem('aura_token')}` }
+      const res = await fetchWithAuth(`/api/files/${id}`, {
+        method: 'DELETE'
       });
       if (!res.ok) throw new Error('Could not delete file');
       setRagFiles((items) => items.filter((file) => file.id !== id));
     } catch (err) {
       setFileError(err?.message || 'Could not delete file');
     }
-  };
-
-  const formatFileSize = (sizeBytes) => {
-    if (!sizeBytes) return '0 KB';
-    if (sizeBytes < 1024 * 1024) return `${Math.max(1, Math.round(sizeBytes / 1024))} KB`;
-    return `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB`;
-  };
-
-  const sourceDisplayName = (file) => {
-    if ((file.source_type || 'pdf') === 'link') {
-      return file.title || file.site_name || file.final_url || file.url || file.filename;
-    }
-    return file.filename;
-  };
-
-  const sourceMeta = (file) => {
-    const sourceType = file.source_type || 'pdf';
-    if (sourceType === 'link') {
-      const url = file.final_url || file.url || '';
-      return `${formatFileSize(file.size_bytes)} · ${file.chunk_count} chunks${url ? ` · ${url}` : ''}`;
-    }
-    return `${formatFileSize(file.size_bytes)} · ${file.chunk_count} chunks`;
   };
 
   const startNewConversation = async () => {
@@ -332,11 +305,10 @@ function VoiceApp({ onResetClient }) {
     if (!convId) return;
 
     try {
-      const res = await fetch(`${API_BASE}/api/conversations/${convId}/messages`, {
+      const res = await fetchWithAuth(`/api/conversations/${convId}/messages`, {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${localStorage.getItem('aura_token')}`
+          'Content-Type': 'application/json'
         },
         body: JSON.stringify({
           role: 'ToolCall',
@@ -373,7 +345,6 @@ function VoiceApp({ onResetClient }) {
         },
       ];
     });
-
   }, []);
 
   useRTVIClientEvent(
@@ -534,11 +505,10 @@ function VoiceApp({ onResetClient }) {
     try {
       let convId = currentConversationId;
       if (!convId) {
-        const res = await fetch(`${API_BASE}/api/conversations`, {
+        const res = await fetchWithAuth(`/api/conversations`, {
           method: 'POST',
           headers: { 
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${localStorage.getItem('aura_token')}`
+            'Content-Type': 'application/json'
           },
           body: JSON.stringify({ title: 'New conversation' })
         });
@@ -582,183 +552,33 @@ function VoiceApp({ onResetClient }) {
 
   return (
     <div className="app-container">
-      <div className="sidebar">
-        <div className="sidebar-header">
-          <div className="brand">
-            <div className="brand-icon">A</div>
-            Aura Voice
-          </div>
-          <div className="sidebar-controls">
-            <button className={`icon-btn ${isMemoryPanelOpen ? 'active' : ''}`} onClick={toggleMemoryPanel} title="Saved Memories">
-              <Brain size={16} strokeWidth={2.5} />
-            </button>
-            <button className="icon-btn" onClick={startNewConversation} title="New Conversation">
-              <Plus size={16} strokeWidth={2.5} />
-            </button>
-            <button className="icon-btn logout-btn" onClick={() => window.dispatchEvent(new Event('logout'))} title="Logout">
-              <LogOut size={16} strokeWidth={2.5} />
-            </button>
-          </div>
-        </div>
-        {isMemoryPanelOpen ? (
-          <div className="memory-panel">
-            <div className="memory-popover-header">
-              <div>
-                <div className="memory-popover-title">Saved memories</div>
-                <div className="memory-popover-subtitle">{memories.length} active</div>
-              </div>
-              <button
-                className="memory-delete-all"
-                onClick={deleteAllMemories}
-                disabled={!memories.length || isMemoryLoading}
-              >
-                Delete all
-              </button>
-            </div>
-
-            {memoryError ? <div className="memory-error">{memoryError}</div> : null}
-
-            <div className="memory-list">
-              {isMemoryLoading ? (
-                <div className="memory-empty">Loading...</div>
-              ) : memories.length ? (
-                memories.map((memory) => (
-                  <div className="memory-item" key={memory.id}>
-                    <div className="memory-item-text">
-                      <div className="memory-label">
-                        {memory.key.replaceAll('_', ' ')}
-                        <span>{memory.fact_type}</span>
-                      </div>
-                      <div className="memory-value">{memory.value}</div>
-                    </div>
-                    <button
-                      className="memory-delete-btn"
-                      onClick={() => deleteMemory(memory.id)}
-                      title="Delete memory"
-                    >
-                      <Trash2 size={14} />
-                    </button>
-                  </div>
-                ))
-              ) : (
-                <div className="memory-empty">No saved memories yet</div>
-              )}
-            </div>
-          </div>
-        ) : null}
-        <div className="sidebar-tabs">
-          <button
-            className={`sidebar-tab ${sidebarTab === 'chats' ? 'active' : ''}`}
-            onClick={() => setSidebarTab('chats')}
-          >
-            Chats
-          </button>
-          <button
-            className={`sidebar-tab ${sidebarTab === 'files' ? 'active' : ''}`}
-            onClick={() => {
-              setSidebarTab('files');
-              fetchFiles();
-            }}
-          >
-            Files
-          </button>
-        </div>
-
-        <div className="sidebar-content" style={{ overflowY: 'auto' }}>
-          {sidebarTab === 'chats' ? (
-            conversations.length === 0 ? (
-              <>
-                <div className="sidebar-title">No conversations</div>
-                <div className="sidebar-subtitle">Your history will appear here</div>
-              </>
-            ) : (
-              <div className="history-list">
-                {conversations.map(conv => (
-                  <div 
-                    key={conv.id} 
-                    className={`history-item ${currentConversationId === conv.id ? 'active' : ''}`}
-                    onClick={() => loadConversation(conv.id)}
-                  >
-                    <MessageSquare size={16} className="history-icon" />
-                    <div className="history-text">
-                      <div className="history-title">{conv.title}</div>
-                      <div className="history-time">{new Date(conv.created_at).toLocaleDateString()}</div>
-                    </div>
-                    <button className="delete-btn" onClick={(e) => deleteConversation(e, conv.id)} title="Delete">
-                      <Trash2 size={14} />
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )
-          ) : (
-            <div className="files-panel">
-              <form className="link-form" onSubmit={addRagLink}>
-                <div className="link-input-wrap">
-                  <LinkIcon size={15} />
-                  <input
-                    value={linkUrl}
-                    onChange={(event) => setLinkUrl(event.target.value)}
-                    placeholder="Paste a link"
-                    disabled={isAddingLink}
-                    inputMode="url"
-                  />
-                </div>
-                <button className="link-add-btn" type="submit" disabled={isAddingLink || !linkUrl.trim()}>
-                  {isAddingLink ? 'Adding...' : 'Add'}
-                </button>
-              </form>
-              <label className={`file-upload ${isUploadingFile ? 'disabled' : ''}`}>
-                <Upload size={16} />
-                <span>{isUploadingFile ? 'Uploading...' : 'Upload PDF'}</span>
-                <input
-                  type="file"
-                  accept="application/pdf,.pdf"
-                  disabled={isUploadingFile}
-                  onChange={uploadRagFile}
-                />
-              </label>
-              <button className="file-refresh-btn" onClick={fetchFiles} disabled={isFilesLoading} title="Refresh files">
-                <RefreshCw size={15} className={isFilesLoading ? 'spinning' : ''} />
-              </button>
-
-              {fileError ? <div className="file-error">{fileError}</div> : null}
-
-              <div className="file-list">
-                {isFilesLoading && !ragFiles.length ? (
-                  <div className="file-empty">Loading files...</div>
-                ) : ragFiles.length ? (
-                  ragFiles.map((file) => (
-                    <div className="file-item" key={file.id}>
-                      {(file.source_type || 'pdf') === 'link' ? (
-                        <LinkIcon size={17} className="file-icon" />
-                      ) : (
-                        <FileText size={17} className="file-icon" />
-                      )}
-                      <div className="file-details">
-                        <div className="file-name" title={sourceDisplayName(file)}>{sourceDisplayName(file)}</div>
-                        <div className="file-meta">
-                          {sourceMeta(file)}
-                        </div>
-                        {file.error ? <div className="file-error-text">{file.error}</div> : null}
-                      </div>
-                      <div className="file-actions">
-                        <span className="source-type">{(file.source_type || 'pdf') === 'link' ? 'Link' : 'PDF'}</span>
-                        <span className={`file-status ${file.status}`}>{file.status}</span>
-                        <button className="delete-btn file-delete" onClick={() => deleteRagFile(file.id)} title="Delete file">
-                          <Trash2 size={14} />
-                        </button>
-                      </div>
-                    </div>
-                  ))
-                ) : (
-                  <div className="file-empty">No PDFs uploaded yet</div>
-                )}
-              </div>
-            </div>
-          )}
-        </div>
-      </div>
+      <Sidebar
+        isMemoryPanelOpen={isMemoryPanelOpen}
+        toggleMemoryPanel={toggleMemoryPanel}
+        memories={memories}
+        deleteAllMemories={deleteAllMemories}
+        deleteMemory={deleteMemory}
+        isMemoryLoading={isMemoryLoading}
+        memoryError={memoryError}
+        sidebarTab={sidebarTab}
+        setSidebarTab={setSidebarTab}
+        startNewConversation={startNewConversation}
+        conversations={conversations}
+        currentConversationId={currentConversationId}
+        loadConversation={loadConversation}
+        deleteConversation={deleteConversation}
+        fetchFiles={fetchFiles}
+        ragFiles={ragFiles}
+        isFilesLoading={isFilesLoading}
+        isUploadingFile={isUploadingFile}
+        uploadRagFile={uploadRagFile}
+        isAddingLink={isAddingLink}
+        linkUrl={linkUrl}
+        setLinkUrl={setLinkUrl}
+        addRagLink={addRagLink}
+        fileError={fileError}
+        deleteRagFile={deleteRagFile}
+      />
 
       <div className="main-stage">
         <div className="main-header">
@@ -769,63 +589,14 @@ function VoiceApp({ onResetClient }) {
           </div>
         </div>
         
-        <div
-          className="transcription-area"
-          ref={transcriptAreaRef}
-          onScroll={handleTranscriptScroll}
-        >
-          {transcripts.length ? (
-            <div className="transcript-list">
-              {transcripts.map((item) => (
-                <div className="transcript-item" key={item.id}>
-                  <div className={`transcript-avatar ${item.role === 'You' ? 'user-avatar' : item.role === 'ToolCall' || item.role === 'RagCall' ? 'tool-avatar' : 'bot-avatar'}`}>
-                    {item.role === 'You' ? <User size={18} strokeWidth={2.5} /> : item.role === 'ToolCall' ? <Wrench size={16} /> : item.role === 'RagCall' ? <FileText size={16} /> : 'A'}
-                  </div>
-                  <div className="transcript-message">
-                    <div className="transcript-role">
-                      {item.role === 'Aura' ? 'Aura AI' : item.role === 'ToolCall' ? 'Tool Call' : item.role === 'RagCall' ? 'RAG Call' : item.role}
-                      {item.timestamp && <span className="transcript-time">{item.timestamp}</span>}
-                    </div>
-                    {item.role === 'ToolCall' || item.role === 'RagCall' ? (() => {
-                      let parsed;
-                      try { parsed = JSON.parse(item.text); } catch { parsed = { function_name: 'Unknown', arguments: item.text }; }
-                      return (
-                        <div className="tool-call-block">
-                          <div className="tool-call-header" onClick={() => toggleToolCall(item.id)}>
-                            {expandedToolCalls[item.id] ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                            <span style={{fontWeight: 500, color: '#475569'}}>{parsed.function_name}</span>
-                          </div>
-                          {expandedToolCalls[item.id] && (
-                            <div className="tool-call-body">
-                              <div className="tool-call-section">
-                                <strong style={{fontSize: '0.75rem', color: '#64748b'}}>Arguments</strong>
-                                <pre>{JSON.stringify(parsed.arguments, null, 2)}</pre>
-                              </div>
-                              {parsed.result && (
-                                <div className="tool-call-section" style={{marginTop: '8px', borderTop: '1px solid #e2e8f0', paddingTop: '8px'}}>
-                                  <strong style={{fontSize: '0.75rem', color: '#64748b'}}>Result</strong>
-                                  <pre style={{maxHeight: '200px', overflowY: 'auto'}}>{JSON.stringify(parsed.result, null, 2)}</pre>
-                                </div>
-                              )}
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })() : (
-                      <div className="transcript-text">{item.text}</div>
-                    )}
-                  </div>
-                </div>
-              ))}
-              <div ref={transcriptBottomRef} aria-hidden="true" />
-            </div>
-          ) : (
-            <div className="empty-state">
-               <Mic size={48} color="#cbd5e1" strokeWidth={1} />
-               <div className="empty-text">Start talking to Aura Voice</div>
-            </div>
-          )}
-        </div>
+        <TranscriptPanel
+          transcripts={transcripts}
+          transcriptAreaRef={transcriptAreaRef}
+          handleTranscriptScroll={handleTranscriptScroll}
+          transcriptBottomRef={transcriptBottomRef}
+          toggleToolCall={toggleToolCall}
+          expandedToolCalls={expandedToolCalls}
+        />
 
         <div className="voice-controls-area">
           <div className="voice-visualizer-container">
