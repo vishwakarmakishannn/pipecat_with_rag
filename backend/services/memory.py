@@ -2,6 +2,8 @@ import asyncio
 import json
 import os
 import re
+import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -17,6 +19,12 @@ from api.auth import ALGORITHM, SECRET_KEY
 from core.database import AsyncSessionLocal
 from core.memory_config import (
     MEMORY_EMBEDDING_DIMENSION,
+    MEMORY_EMBEDDING_CACHE_SIZE,
+    MEMORY_EMBEDDING_CACHE_TTL_SECONDS,
+    MEMORY_FACTS_MAX_CHARS,
+    MEMORY_SUMMARY_MAX_CHARS,
+    MEMORY_RECENT_MAX_CHARS,
+    MEMORY_PRIOR_MAX_CHARS,
     MEMORY_EMBEDDING_PROVIDER,
     MEMORY_FACT_CONFIDENCE_MIN,
     MEMORY_LLM_TIMEOUT_SECONDS,
@@ -25,7 +33,6 @@ from core.memory_config import (
     MEMORY_VECTOR_DB,
     PRIOR_CONVERSATION_MESSAGE_LIMIT,
     RECENT_MESSAGE_LIMIT,
-    SUMMARY_CHAR_THRESHOLD,
     SUMMARY_MESSAGE_THRESHOLD,
 )
 from core.models import Conversation, MemoryChunk, Message, User, UserMemory
@@ -51,6 +58,40 @@ INVALID_NAME_VALUES = {
     "going",
     "working",
 }
+_memory_llm_backoff_until = 0.0
+_google_client = None
+_openai_client = None
+_embedding_cache: OrderedDict[tuple[str, str, str, int], tuple[float, list[float]]] = OrderedDict()
+_embedding_inflight: dict[tuple[str, str, str, int], asyncio.Task] = {}
+_embedding_lock = asyncio.Lock()
+
+
+def _get_google_client():
+    global _google_client
+    if _google_client is None:
+        from google import genai
+        _google_client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+    return _google_client
+
+
+def _get_openai_client():
+    global _openai_client
+    if _openai_client is None:
+        from openai import AsyncOpenAI
+        _openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    return _openai_client
+
+
+def is_memory_fact_candidate(text_value: str) -> bool:
+    normalized = re.sub(r"\s+", " ", (text_value or "").strip().lower())
+    if not normalized or normalized.endswith("?"):
+        return False
+    patterns = (
+        r"\b(my name is|call me|i am from|i live in|i work as|i work at)\b",
+        r"\b(i like|i love|i prefer|i dislike|i hate|my goal is|i want to)\b",
+        r"\b(my preferred language is|i speak)\b",
+    )
+    return any(re.search(pattern, normalized) for pattern in patterns)
 
 
 @dataclass
@@ -128,6 +169,21 @@ async def _load_most_recent_prior_conversation(
     return result.scalars().first()
 
 
+async def _load_active_facts(user_id: int) -> list[UserMemory]:
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(UserMemory)
+            .where(UserMemory.user_id == user_id, UserMemory.status == "active")
+            .order_by(UserMemory.fact_type.asc(), UserMemory.key.asc(), UserMemory.updated_at.desc())
+        )
+        return list(result.scalars().all())
+
+
+async def _load_recent_messages_in_session(conversation_id: int, limit: int) -> list[Message]:
+    async with AsyncSessionLocal() as db:
+        return await _load_recent_messages(db, conversation_id, limit)
+
+
 async def load_memory_bundle(body: Any, recent_limit: int = RECENT_MESSAGE_LIMIT) -> MemoryBundle | None:
     request_body = normalize_runner_body(body)
     token = request_body.get("token")
@@ -158,38 +214,37 @@ async def load_memory_bundle(body: Any, recent_limit: int = RECENT_MESSAGE_LIMIT
             logger.warning("Memory hydration skipped: conversation does not belong to user")
             return None
 
-        facts_result = await db.execute(
-            select(UserMemory)
-            .where(UserMemory.user_id == user.id, UserMemory.status == "active")
-            .order_by(UserMemory.fact_type.asc(), UserMemory.key.asc(), UserMemory.updated_at.desc())
-        )
+        user_id = user.id
 
-        recent_messages = await _load_recent_messages(db, conversation_id, recent_limit)
+    facts, recent_messages = await asyncio.gather(
+        _load_active_facts(user_id),
+        _load_recent_messages_in_session(conversation_id, recent_limit),
+    )
 
-        prior_conversation = None
-        prior_recent_messages = None
-        if not recent_messages:
+    prior_conversation = None
+    prior_recent_messages = None
+    if not recent_messages:
+        async with AsyncSessionLocal() as db:
             prior_conversation = await _load_most_recent_prior_conversation(
                 db,
-                user.id,
+                user_id,
                 conversation_id,
             )
-            if prior_conversation:
-                prior_recent_messages = await _load_recent_messages(
-                    db,
-                    prior_conversation.id,
-                    PRIOR_CONVERSATION_MESSAGE_LIMIT,
-                )
+        if prior_conversation:
+            prior_recent_messages = await _load_recent_messages_in_session(
+                prior_conversation.id,
+                PRIOR_CONVERSATION_MESSAGE_LIMIT,
+            )
 
-        return MemoryBundle(
-            user=user,
-            primary_conversation=conversation,
-            facts=facts_result.scalars().all(),
-            primary_summary=conversation.summary or "",
-            primary_recent_messages=recent_messages,
-            prior_conversation=prior_conversation,
-            prior_recent_messages=prior_recent_messages,
-        )
+    return MemoryBundle(
+        user=user,
+        primary_conversation=conversation,
+        facts=facts,
+        primary_summary=conversation.summary or "",
+        primary_recent_messages=recent_messages,
+        prior_conversation=prior_conversation,
+        prior_recent_messages=prior_recent_messages,
+    )
 
 
 def message_to_llm(message: Message) -> dict[str, str] | None:
@@ -237,7 +292,23 @@ def _format_facts(facts: list[UserMemory]) -> str:
         if fact.fact_type and fact.fact_type != "profile":
             label = f"{fact.fact_type}.{fact.key}"
         lines.append(f"- {label}: {fact.value}")
-    return "\n".join(lines)
+    return "\n".join(lines)[:MEMORY_FACTS_MAX_CHARS]
+
+
+def _recent_llm_messages(messages: list[Message]) -> list[dict[str, str]]:
+    selected: list[dict[str, str]] = []
+    total_chars = 0
+    for message in reversed(messages):
+        llm_message = message_to_llm(message)
+        if llm_message is None:
+            continue
+        content = llm_message["content"]
+        remaining = MEMORY_RECENT_MAX_CHARS - total_chars
+        if remaining <= 0:
+            break
+        selected.append({**llm_message, "content": content[:remaining]})
+        total_chars += min(len(content), remaining)
+    return list(reversed(selected))
 
 
 def build_memory_messages(bundle: MemoryBundle | None) -> list[dict[str, str]]:
@@ -265,16 +336,12 @@ def build_memory_messages(bundle: MemoryBundle | None) -> list[dict[str, str]]:
                 "content": (
                     "Summary of this selected conversation so far. Use it to continue "
                     "the old conversation accurately:\n"
-                    f"{bundle.summary}"
+                    f"{bundle.summary[:MEMORY_SUMMARY_MAX_CHARS]}"
                 ),
             }
         )
 
-    messages.extend(
-        llm_message
-        for message in bundle.primary_recent_messages
-        if (llm_message := message_to_llm(message)) is not None
-    )
+    messages.extend(_recent_llm_messages(bundle.primary_recent_messages))
 
     if bundle.prior_conversation and bundle.prior_recent_messages:
         prior_lines = []
@@ -295,7 +362,7 @@ def build_memory_messages(bundle: MemoryBundle | None) -> list[dict[str, str]]:
                     "what you talked about previously, what you were just discussing, or "
                     "similar continuity questions in a new conversation. Do not bring it "
                     "up unprompted.\n"
-                    + "\n".join(prior_lines)
+                    + "\n".join(prior_lines)[:MEMORY_PRIOR_MAX_CHARS]
                 ),
             }
         )
@@ -322,14 +389,16 @@ def _extract_json_object(text_value: str) -> dict[str, Any]:
 
 
 async def _generate_text_with_memory_llm(prompt: str) -> str | None:
+    global _memory_llm_backoff_until
+    if asyncio.get_running_loop().time() < _memory_llm_backoff_until:
+        return None
     provider = os.getenv("LLM_PROVIDER", "google").lower()
 
     async def generate_google() -> str | None:
         api_key = os.getenv("GOOGLE_API_KEY")
         if not api_key:
             return None
-        from google import genai
-        client = genai.Client(api_key=api_key)
+        client = _get_google_client()
         response = await client.aio.models.generate_content(
             model=os.getenv("GOOGLE_MEMORY_MODEL", os.getenv("GOOGLE_MODEL", "gemini-2.5-flash")),
             contents=prompt,
@@ -340,8 +409,7 @@ async def _generate_text_with_memory_llm(prompt: str) -> str | None:
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             return None
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(api_key=api_key)
+        client = _get_openai_client()
         response = await client.chat.completions.create(
             model=os.getenv("OPENAI_MEMORY_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini")),
             messages=[{"role": "user", "content": prompt}]
@@ -357,15 +425,12 @@ async def _generate_text_with_memory_llm(prompt: str) -> str | None:
             return await asyncio.wait_for(generator(), timeout=MEMORY_LLM_TIMEOUT_SECONDS)
         except Exception as exc:
             logger.warning(f"Memory LLM call failed: {exc}")
+            if "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc):
+                _memory_llm_backoff_until = asyncio.get_running_loop().time() + 60.0
     return None
 
 
-_embedding_model = None
-async def embed_text(value: str) -> list[float] | None:
-    value = (value or "").strip()
-    if not value or MEMORY_VECTOR_DB != "pgvector":
-        return None
-
+async def _embed_uncached(value: str, provider: str) -> list[float] | None:
     def normalize_embedding(embedding: list[float] | None, provider: str) -> list[float] | None:
         if not embedding:
             return None
@@ -377,14 +442,11 @@ async def embed_text(value: str) -> list[float] | None:
             return None
         return embedding
 
-    provider = os.getenv("MEMORY_EMBEDDING_PROVIDER", "google").lower()
-
     async def embed_google() -> list[float] | None:
         api_key = os.getenv("GOOGLE_API_KEY")
         if not api_key: return None
-        from google import genai
         from google.genai import types
-        client = genai.Client(api_key=api_key)
+        client = _get_google_client()
         model = os.getenv("GOOGLE_EMBEDDING_MODEL", "gemini-embedding-001")
         response = await client.aio.models.embed_content(
             model=model,
@@ -396,8 +458,7 @@ async def embed_text(value: str) -> list[float] | None:
     async def embed_openai() -> list[float] | None:
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key: return None
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(api_key=api_key)
+        client = _get_openai_client()
         model = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
         response = await client.embeddings.create(input=value, model=model)
         return normalize_embedding(response.data[0].embedding, "OpenAI")
@@ -411,6 +472,49 @@ async def embed_text(value: str) -> list[float] | None:
             return await asyncio.wait_for(generator(), timeout=MEMORY_LLM_TIMEOUT_SECONDS * 5)
         except Exception as exc:
             logger.warning(f"Embedding call failed: {exc}")
+    return None
+
+
+async def embed_text(value: str) -> list[float] | None:
+    value = re.sub(r"\s+", " ", (value or "").strip())
+    if not value or MEMORY_VECTOR_DB != "pgvector":
+        return None
+
+    provider = os.getenv("MEMORY_EMBEDDING_PROVIDER", "google").lower()
+    model = (
+        os.getenv("GOOGLE_EMBEDDING_MODEL", "gemini-embedding-001")
+        if provider == "google"
+        else os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+    )
+    key = (provider, model, value, MEMORY_EMBEDDING_DIMENSION)
+    now = time.monotonic()
+
+    async with _embedding_lock:
+        cached = _embedding_cache.get(key)
+        if cached and now - cached[0] <= MEMORY_EMBEDDING_CACHE_TTL_SECONDS:
+            _embedding_cache.move_to_end(key)
+            return list(cached[1])
+        if cached:
+            _embedding_cache.pop(key, None)
+        task = _embedding_inflight.get(key)
+        if task is None:
+            task = asyncio.create_task(_embed_uncached(value, provider))
+            _embedding_inflight[key] = task
+
+    try:
+        embedding = await asyncio.shield(task)
+    finally:
+        async with _embedding_lock:
+            if _embedding_inflight.get(key) is task and task.done():
+                _embedding_inflight.pop(key, None)
+
+    if embedding:
+        async with _embedding_lock:
+            _embedding_cache[key] = (time.monotonic(), list(embedding))
+            _embedding_cache.move_to_end(key)
+            while len(_embedding_cache) > max(1, MEMORY_EMBEDDING_CACHE_SIZE):
+                _embedding_cache.popitem(last=False)
+        return list(embedding)
     return None
 
 
@@ -497,6 +601,8 @@ def _valid_fact_event(event: dict[str, Any]) -> dict[str, Any] | None:
 
 
 async def classify_memory_events(user_text: str, assistant_text: str | None = None) -> list[dict[str, Any]]:
+    if not is_memory_fact_candidate(user_text):
+        return []
     base_prompt = load_memory_prompt()
     prompt = (
         f"{base_prompt}\n\n"
@@ -729,18 +835,33 @@ async def update_conversation_summary_if_needed(db: AsyncSession, conversation: 
     )
     message_count = count_result.scalar_one()
 
+    if message_count <= SUMMARY_MESSAGE_THRESHOLD:
+        if message_count % 8 != 0:
+            return
+        recent_result = await db.execute(
+            select(Message)
+            .where(Message.conversation_id == conversation.id, Message.role.in_(["You", "Aura"]))
+            .order_by(Message.created_at.desc(), Message.id.desc())
+            .limit(8)
+        )
+        recent_messages = list(reversed(recent_result.scalars().all()))
+        if len(recent_messages) >= 2:
+            await store_memory_chunk(db, conversation, recent_messages)
+        return
+
     messages_result = await db.execute(
         select(Message)
         .where(Message.conversation_id == conversation.id, Message.role.in_(["You", "Aura"]))
-        .order_by(Message.created_at.asc(), Message.id.asc())
+        .order_by(Message.created_at.desc(), Message.id.desc())
+        .limit(40)
     )
-    messages = messages_result.scalars().all()
+    messages = list(reversed(messages_result.scalars().all()))
     total_chars = sum(len(message.content or "") for message in messages)
 
-    if message_count > SUMMARY_MESSAGE_THRESHOLD or total_chars > SUMMARY_CHAR_THRESHOLD:
+    if message_count % SUMMARY_MESSAGE_THRESHOLD == 0:
         conversation.summary = await generate_conversation_summary(messages)
 
-    if len(messages) >= 2 and messages[-1].role == "Aura":
+    if message_count % 8 == 0 and len(messages) >= 2 and messages[-1].role == "Aura":
         await store_memory_chunk(db, conversation, messages[-8:])
 
 
@@ -773,7 +894,7 @@ async def save_conversation_message(
         await db.refresh(message)
         
     from core.task_queue import task_queue
-    task_queue.enqueue(_process_saved_message_background, conversation_id, message.id)
+    task_queue.enqueue(_process_saved_message_background, conversation_id, message.id, key=conversation_id)
     return message
 
 
@@ -789,11 +910,11 @@ async def _process_saved_message_background(conversation_id: int, message_id: in
                 events = await classify_memory_events(message.content)
                 await apply_fact_events(db, conversation.user_id, events, message.id)
         
-            if message.role in {"You", "Aura"}:
+            if message.role == "Aura":
                 await update_conversation_summary_if_needed(db, conversation)
             
             await db.commit()
 
 async def process_saved_message(db: AsyncSession, conversation: Conversation, message: Message) -> None:
     from core.task_queue import task_queue
-    task_queue.enqueue(_process_saved_message_background, conversation.id, message.id)
+    task_queue.enqueue(_process_saved_message_background, conversation.id, message.id, key=conversation.id)

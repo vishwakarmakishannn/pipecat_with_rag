@@ -1,4 +1,4 @@
-import React, { useCallback, useMemo, useState } from 'react';
+import React, { lazy, Suspense, useCallback, useMemo, useState } from 'react';
 import { RTVIEvent, PipecatClient } from '@pipecat-ai/client-js';
 import {
   PipecatClientAudio,
@@ -12,15 +12,17 @@ import {
 import { SmallWebRTCTransport } from '@pipecat-ai/small-webrtc-transport';
 import { Mic, Volume2, X } from 'lucide-react';
 import { jwtDecode } from 'jwt-decode';
-import Auth from './components/Auth';
-import Sidebar from './components/Sidebar';
-import TranscriptPanel from './components/TranscriptPanel';
 import { fetchWithAuth, API_BASE } from './utils/api';
 import './App.css';
 
 const START_ENDPOINT =
   import.meta.env.VITE_PIPECAT_START_URL ||
   `${API_BASE}/start`;
+
+const Auth = lazy(() => import('./components/Auth'));
+const Sidebar = lazy(() => import('./components/Sidebar'));
+const TranscriptPanel = lazy(() => import('./components/TranscriptPanel'));
+const ChunkInspector = lazy(() => import('./components/ChunkInspector'));
 
 function createPipecatClient() {
   return new PipecatClient({
@@ -64,6 +66,7 @@ function VoiceApp({ onResetClient }) {
   const [isAddingLink, setIsAddingLink] = useState(false);
   const [linkUrl, setLinkUrl] = useState('');
   const [fileError, setFileError] = useState('');
+  const [inspectedFile, setInspectedFile] = useState(null);
   
   const currentConversationIdRef = React.useRef(null);
   const transcriptAreaRef = React.useRef(null);
@@ -76,6 +79,7 @@ function VoiceApp({ onResetClient }) {
   const savedToolCallIdsRef = React.useRef(new Set());
   
   const [expandedToolCalls, setExpandedToolCalls] = useState({});
+  const [latencyStats, setLatencyStats] = useState([]);
 
   const toggleToolCall = (id) => {
     setExpandedToolCalls(prev => ({...prev, [id]: !prev[id]}));
@@ -298,6 +302,7 @@ function VoiceApp({ onResetClient }) {
     currentConversationIdRef.current = null;
     setCurrentConversationId(null);
     setTranscripts([]);
+    setLatencyStats([]);
   };
 
   const saveToolCallTranscript = useCallback(async (payload) => {
@@ -477,6 +482,10 @@ function VoiceApp({ onResetClient }) {
     RTVIEvent.ServerMessage,
     useCallback((data) => {
       const messageData = data?.data || data;
+      if (messageData?.type === 'latency_stats' && messageData.payload) {
+        setLatencyStats((items) => [...items.slice(-19), { ...messageData.payload, receivedAt: Date.now() }]);
+        return;
+      }
       if (messageData?.type !== 'rag_call' || !messageData.payload) return;
       const payload = messageData.payload;
       const ragCallId = payload.rag_call_id || `rag-${Date.now()}`;
@@ -501,6 +510,7 @@ function VoiceApp({ onResetClient }) {
 
     setError('');
     setIsConnecting(true);
+    setLatencyStats([]);
 
     try {
       let convId = currentConversationId;
@@ -578,6 +588,9 @@ function VoiceApp({ onResetClient }) {
         addRagLink={addRagLink}
         fileError={fileError}
         deleteRagFile={deleteRagFile}
+        inspectRagFile={setInspectedFile}
+        latencyStats={latencyStats}
+        clearLatencyStats={() => setLatencyStats([])}
       />
 
       <div className="main-stage">
@@ -650,6 +663,9 @@ function VoiceApp({ onResetClient }) {
           </div>
         </div>
       </div>
+      {inspectedFile ? (
+        <ChunkInspector file={inspectedFile} onClose={() => setInspectedFile(null)} />
+      ) : null}
     </div>
   );
 }
@@ -676,12 +692,12 @@ function App() {
   }, []);
 
   if (!isTokenValid) {
-    return <Auth onLogin={handleLogin} />;
+    return <Suspense fallback={null}><Auth onLogin={handleLogin} /></Suspense>;
   }
 
   return (
     <PipecatClientProvider client={client}>
-      <VoiceApp onResetClient={resetClient} />
+      <Suspense fallback={<div className="app-container" />}><VoiceApp onResetClient={resetClient} /></Suspense>
       <PipecatClientAudio />
     </PipecatClientProvider>
   );

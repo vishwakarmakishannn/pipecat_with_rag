@@ -60,6 +60,33 @@ class RagSearchResult(BaseModel):
     score: float
 
 
+class RagChunkResponse(BaseModel):
+    id: int
+    chunk_index: int
+    page_start: int | None
+    page_end: int | None
+    heading_path: str | None
+    content: str
+    content_chars: int
+    embedding_stored: bool
+    embedding_dimension: int
+    embedding_preview: list[float]
+    search_indexed: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class RagChunkPageResponse(BaseModel):
+    file_id: int
+    filename: str
+    source_type: str
+    status: str
+    total: int
+    offset: int
+    limit: int
+    items: list[RagChunkResponse]
+
+
 def _file_response(rag_file: RagFile, chunk_count: int = 0) -> RagFileResponse:
     return RagFileResponse(
         id=rag_file.id,
@@ -88,6 +115,25 @@ def _is_pdf_upload(file: UploadFile) -> bool:
         "binary/octet-stream",
         "",
     }
+
+
+def _chunk_response(chunk: RagChunk) -> RagChunkResponse:
+    embedding = list(chunk.embedding) if chunk.embedding is not None else []
+    return RagChunkResponse(
+        id=chunk.id,
+        chunk_index=chunk.chunk_index,
+        page_start=chunk.page_start,
+        page_end=chunk.page_end,
+        heading_path=chunk.heading_path,
+        content=chunk.content,
+        content_chars=len(chunk.content),
+        embedding_stored=bool(embedding),
+        embedding_dimension=len(embedding),
+        embedding_preview=[float(value) for value in embedding[:8]],
+        search_indexed=chunk.search_vector is not None,
+        created_at=chunk.created_at,
+        updated_at=chunk.updated_at,
+    )
 
 
 @router.get("", response_model=List[RagFileResponse])
@@ -174,6 +220,52 @@ async def add_link(
     from core.task_queue import task_queue
     task_queue.enqueue(process_rag_file, rag_file.id)
     return _file_response(rag_file, 0)
+
+
+@router.get("/{file_id}/chunks", response_model=RagChunkPageResponse)
+async def list_file_chunks(
+    file_id: int,
+    offset: int = 0,
+    limit: int = 20,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    if offset < 0:
+        raise HTTPException(status_code=422, detail="Offset must be zero or greater")
+    if limit < 1 or limit > 100:
+        raise HTTPException(status_code=422, detail="Limit must be between 1 and 100")
+
+    file_result = await db.execute(
+        select(RagFile).where(RagFile.id == file_id, RagFile.user_id == current_user.id)
+    )
+    rag_file = file_result.scalars().first()
+    if not rag_file:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    total_result = await db.execute(
+        select(func.count(RagChunk.id)).where(
+            RagChunk.file_id == file_id,
+            RagChunk.user_id == current_user.id,
+        )
+    )
+    total = total_result.scalar_one()
+    chunks_result = await db.execute(
+        select(RagChunk)
+        .where(RagChunk.file_id == file_id, RagChunk.user_id == current_user.id)
+        .order_by(RagChunk.chunk_index)
+        .offset(offset)
+        .limit(limit)
+    )
+    return RagChunkPageResponse(
+        file_id=rag_file.id,
+        filename=rag_file.filename,
+        source_type=rag_file.source_type or "pdf",
+        status=rag_file.status,
+        total=total,
+        offset=offset,
+        limit=limit,
+        items=[_chunk_response(chunk) for chunk in chunks_result.scalars().all()],
+    )
 
 
 @router.delete("/{file_id}")

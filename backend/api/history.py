@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, Literal
 from datetime import datetime
 
 from core.database import get_db
@@ -13,7 +13,7 @@ from services.memory import process_saved_message
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
 
 class MessageCreate(BaseModel):
-    role: str = Field(..., pattern=r"^(You|Aura)$")
+    role: Literal["You", "Aura", "ToolCall", "RagCall"]
     content: str = Field(..., min_length=1, max_length=100000)
 
 class MessageResponse(BaseModel):

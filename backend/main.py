@@ -28,6 +28,8 @@ import time
 from dotenv import load_dotenv
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
+from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.frames.frames import (
     Frame,
     LLMFullResponseEndFrame,
@@ -55,6 +57,7 @@ from providers.tts.factory import get_tts
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
 from pipecat.workers.runner import WorkerRunner
+from pipecat.turns.user_turn_strategies import UserTurnStrategies, TurnAnalyzerUserTurnStopStrategy
 from services.memory import build_memory_messages, build_turn_memory_context, load_memory_bundle, save_conversation_message
 from core.memory_config import MEMORY_EMBEDDING_DIMENSION
 from services.rag import build_rag_context_with_payload, is_rag_query
@@ -68,6 +71,9 @@ from core.processors import (
     ConversationMemoryProcessor,
     ToolFillerProcessor,
     ContextRetrievalProcessor,
+    TurnContextCleanupProcessor,
+    TurnLatencyState,
+    LatencyBoundaryProcessor,
 )
 
 
@@ -102,7 +108,6 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         )
     conversation_id = memory_bundle.conversation.id if memory_bundle else None
     user_id = memory_bundle.user.id if memory_bundle else None
-    user_memory = ConversationMemoryProcessor(conversation_id, capture="user", name="UserMemory")
     assistant_memory = ConversationMemoryProcessor(
         conversation_id,
         capture="assistant",
@@ -113,28 +118,59 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         messages=memory_messages,
         tools=[tavily_search, raise_issue]
     )
-    context_retrieval = ContextRetrievalProcessor(user_id, conversation_id, context, name="ContextRetrieval")
+    latency_state = TurnLatencyState(session_id=getattr(runner_args, "session_id", None))
+    context_retrieval = ContextRetrievalProcessor(user_id, conversation_id, context, latency_state, name="ContextRetrieval")
+    context_cleanup = TurnContextCleanupProcessor(
+        context_retrieval, latency_state, name="TurnContextCleanup"
+    )
+    smart_turn_stop_secs = float(os.getenv("SMART_TURN_STOP_SECS", "1.5"))
+    user_turn_strategies = UserTurnStrategies(
+        stop=[
+            TurnAnalyzerUserTurnStopStrategy(
+                turn_analyzer=LocalSmartTurnAnalyzerV3(
+                    params=SmartTurnParams(stop_secs=smart_turn_stop_secs)
+                )
+            )
+        ]
+    )
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
             vad_analyzer=SileroVADAnalyzer(),
+            user_turn_strategies=user_turn_strategies,
         ),
     )
 
-    tool_filler = ToolFillerProcessor(name="ToolFiller")
+    @user_aggregator.event_handler("on_user_turn_stopped")
+    async def persist_complete_user_turn(aggregator, strategy, message):
+        content = (message.content or "").strip()
+        if content:
+            from core.task_queue import task_queue
+            task_queue.enqueue(
+                save_conversation_message,
+                conversation_id,
+                "You",
+                content,
+                key=conversation_id,
+            )
+
+    tool_filler = ToolFillerProcessor(latency_state, name="ToolFiller")
 
     # Pipeline - assembled from reusable components
     pipeline = Pipeline(
         [
             transport.input(),
             stt,
-            user_memory,
+            LatencyBoundaryProcessor(latency_state, "stt", name="PostSTTLatency"),
             context_retrieval,
             user_aggregator,
             llm,
+            LatencyBoundaryProcessor(latency_state, "llm", name="PostLLMLatency"),
+            context_cleanup,
             tool_filler,
             assistant_memory,
             tts,
+            LatencyBoundaryProcessor(latency_state, "tts", name="PostTTSLatency"),
             transport.output(),
             assistant_aggregator,
         ]
@@ -182,14 +218,17 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
 async def bot(runner_args: RunnerArguments):
     """Main bot entry point."""
 
+    output_chunks = int(os.getenv("AUDIO_OUT_10MS_CHUNKS", "2"))
     transport_params = {
         "daily": lambda: DailyParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
+            audio_out_10ms_chunks=output_chunks,
         ),
         "webrtc": lambda: TransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
+            audio_out_10ms_chunks=output_chunks,
         ),
     }
 

@@ -1,4 +1,3 @@
-import React from 'react';
 import { User, FileText, Wrench, ChevronDown, ChevronRight, Mic } from 'lucide-react';
 
 export default function TranscriptPanel({

@@ -23,4 +23,4 @@ COPY . .
 RUN uv sync --frozen
 
 # Run the app using uv
-CMD ["uv", "run", "main.py"]
+CMD ["/bin/sh", "-c", "uv run alembic upgrade head && exec uv run main.py"]

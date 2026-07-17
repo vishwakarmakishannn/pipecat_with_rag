@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { User, Lock, ArrowRight, UserPlus } from 'lucide-react';
-import { API_BASE } from '../utils/api';
+import { apiRequest } from '../utils/api';
 import './Auth.css';
 
 export default function Auth({ onLogin }) {
@@ -18,18 +18,14 @@ export default function Auth({ onLogin }) {
     const endpoint = isLogin ? '/api/auth/login' : '/api/auth/register';
     
     try {
-      // Use dynamic API base instead of hardcoded localhost
-      const res = await fetch(`${API_BASE}${endpoint}`, {
+      const res = await apiRequest(endpoint, {
         method: 'POST',
+        auth: false,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username, password })
       });
       
       const data = await res.json();
-      
-      if (!res.ok) {
-        throw new Error(data.detail || 'Authentication failed');
-      }
       
       localStorage.setItem('aura_token', data.access_token);
       onLogin(data.access_token);

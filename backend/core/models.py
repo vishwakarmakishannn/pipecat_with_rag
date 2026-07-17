@@ -80,6 +80,12 @@ class MemoryChunk(Base):
     __tablename__ = "memory_chunks"
     __table_args__ = (
         UniqueConstraint("conversation_id", "message_start_id", "message_end_id", name="uq_memory_chunk_message_window"),
+        Index(
+            "idx_memory_chunks_embedding",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
     )
 
     id = Column(Integer, primary_key=True, index=True)
@@ -99,6 +105,7 @@ class MemoryChunk(Base):
 
 class RagFile(Base):
     __tablename__ = "rag_files"
+    __table_args__ = (Index("idx_rag_files_user_status", "user_id", "status"),)
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
@@ -123,7 +130,17 @@ class RagFile(Base):
 
 class RagChunk(Base):
     __tablename__ = "rag_chunks"
-    __table_args__ = (UniqueConstraint("file_id", "chunk_index", name="uq_rag_chunk_file_index"),)
+    __table_args__ = (
+        UniqueConstraint("file_id", "chunk_index", name="uq_rag_chunk_file_index"),
+        Index("idx_rag_chunks_user_file", "user_id", "file_id"),
+        Index("idx_rag_chunks_search_vector", "search_vector", postgresql_using="gin"),
+        Index(
+            "idx_rag_chunks_embedding",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)

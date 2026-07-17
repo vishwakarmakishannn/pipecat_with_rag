@@ -1,4 +1,5 @@
 import pytest
+import asyncio
 
 from services.memory import (
     MemoryBundle,
@@ -7,7 +8,9 @@ from services.memory import (
     build_turn_memory_context,
     classify_memory_events,
     message_to_llm,
+    is_memory_fact_candidate,
 )
+import services.memory as memory_service
 from core.models import Conversation, MemoryChunk, Message, User, UserMemory
 
 
@@ -132,6 +135,13 @@ def test_build_memory_chunk_from_turn_window():
     assert "I like football." in chunk["chunk_text"]
 
 
+def test_memory_fact_candidate_gate():
+    assert is_memory_fact_candidate("My name is Raj")
+    assert is_memory_fact_candidate("I prefer concise answers")
+    assert not is_memory_fact_candidate("Okay, thank you.")
+    assert not is_memory_fact_candidate("What is my name?")
+
+
 @pytest.mark.anyio
 async def test_turn_memory_context_formats_retrieved_chunks(monkeypatch):
     async def fake_retrieve(_user_id, _query, _top_k):
@@ -155,3 +165,29 @@ async def test_turn_memory_context_formats_retrieved_chunks(monkeypatch):
 
     assert "Relevant long-term episodic memories" in context
     assert "Discussed AI basics." in context
+
+
+@pytest.mark.anyio
+async def test_embed_text_deduplicates_concurrent_requests(monkeypatch):
+    calls = 0
+
+    async def fake_embed(value, provider):
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0)
+        return [0.25] * memory_service.MEMORY_EMBEDDING_DIMENSION
+
+    memory_service._embedding_cache.clear()
+    memory_service._embedding_inflight.clear()
+    monkeypatch.setattr(memory_service, "_embed_uncached", fake_embed)
+    monkeypatch.setattr(memory_service, "MEMORY_VECTOR_DB", "pgvector")
+    monkeypatch.setenv("MEMORY_EMBEDDING_PROVIDER", "google")
+
+    first, second = await asyncio.gather(
+        memory_service.embed_text("same   query"),
+        memory_service.embed_text("same query"),
+    )
+    third = await memory_service.embed_text("same query")
+
+    assert calls == 1
+    assert first == second == third

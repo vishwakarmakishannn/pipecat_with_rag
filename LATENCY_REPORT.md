@@ -1,164 +1,201 @@
-# Aura Voice Latency Reduction Report
+# Aura Voice Final Latency Audit
 
 **Review date:** 2026-07-17  
-**Evidence:** supplied live-call log, current backend/frontend source, refreshed Graphify code graph, and local validation  
-**Goal:** reduce perceived voice-response latency without removing RAG, durable memory, conversational continuity, tools, or streaming behavior
+**Scope:** complete backend/frontend source, current Graphify graph, all supplied runtime logs, live PostgreSQL schema, current runtime configuration, backend tests, frontend lint/build
+**Verdict:** substantially improved and usable for local beta testing, but not yet latency-optimal or production-ready at scale
 
-## 1. Executive summary
+## 1. Executive verdict
 
-The provider cascade is already reasonably fast. In the three logged user turns, Google LLM first-token latency was **0.598–0.675 s** and Deepgram TTS first-audio latency was **0.319–0.508 s**. The largest consistently avoidable delay is the context-retrieval gate between final STT and the LLM: every authenticated transcription runs hybrid RAG, including ordinary conversation that is ultimately logged as `RAG skipped`.
+The system is not perfect, but the earlier dominant latency defects have been fixed:
 
-Measured end-of-turn-to-bot-audio latency was approximately **1.76 s, 2.30 s, and 2.88 s** (mean **2.31 s**). After the final STT event, rejected RAG retrieval alone took approximately **0.60 s, 0.97 s, and 0.56 s** (mean **0.71 s**). The slowest turn also spent about **1.40 s** between smart-turn completion and final STT, so STT/finalization variance is the second major target.
+- ordinary turns bypass RAG and memory retrieval;
+- explicit PDF/link turns receive bounded retrieval;
+- retrieval delivery is serialized and cancelled during cleanup;
+- query-specific context is removed before the next transcription;
+- derived-memory work is gated, keyed by conversation, and drained at shutdown;
+- web-search results and RAG context are bounded;
+- Deepgram keepalive/media failures now schedule recovery;
+- the UI exposes direct/RAG/tool timing.
 
-The best low-risk path is:
+The provider cascade is already competitive when turn detection behaves normally. Current logs show direct turns at approximately **1.2–1.4 seconds from final transcript to first generated audio**. Explicit RAG adds about **0.62–0.65 seconds**, producing roughly **2.25 seconds** from final transcript to first answer audio. Provider timings are normally:
 
-1. Keep RAG and episodic memory, but route before embedding and enforce a small retrieval deadline.
-2. Preserve ordering with one supervised retrieval operation per session/turn.
-3. Make retrieved context turn-scoped instead of permanently growing the LLM context.
-4. Isolate and coalesce derived-memory jobs so they cannot race or consume the live assistant's quota.
-5. Add timestamps around the exact boundaries needed to optimize p50/p95 rather than relying on provider TTFB alone.
+| Stage | Observed healthy range |
+|---|---:|
+| Google/Gemini first response text | 0.60–1.05 s |
+| Deepgram TTS first audio | 0.30–0.52 s |
+| Explicit RAG retrieval | 0.62–0.65 s |
+| Direct final-STT → first generated audio | 1.2–1.4 s |
+| RAG final-STT → first generated audio | about 2.25 s |
 
-With the observed sample, routing irrelevant turns before retrieval should save roughly **0.6–1.0 s** on ordinary turns. That would put the first two observed turns near **1.2–1.3 s** without changing providers or dropping features. The third turn remains limited by STT finalization and needs separate measurement/tuning.
+The largest remaining user-visible variance is now **turn finalization**, not normal LLM or TTS performance. Several logs show finalized transcript fragments arriving well before Smart Turn triggers inference. One direct turn took **4.14 seconds** from the last recorded fragment boundary to generated audio, including about **2.76 seconds before inference began**. The default Smart Turn maximum silence window is three seconds, matching the observed delay.
 
-## 2. What the log shows
+The migration/index risk identified during inspection has now been repaired: the baseline creates the schema, additive migrations synchronize legacy timestamp types and indexes, custom indexes are represented in ORM metadata, and `alembic check` reports no drift.
 
-| Turn | Smart EOT | Final STT event | RAG decision | LLM TTFB | TTS TTFA | Bot audio after EOT |
-|---|---:|---:|---:|---:|---:|---:|
-| “What is your name?” | 10:31:59.007 | +0.192 s | skipped at +0.788 s | 0.675 s | 0.319 s | 1.762 s |
-| “What can you do for me?” | 10:32:07.134 | +0.311 s | skipped at +1.285 s | 0.656 s | 0.508 s | 2.296 s* |
-| “Okay. Thank you.” | 10:32:16.136 | +1.403 s | skipped at +1.962 s | 0.598 s | 0.380 s | 2.875 s |
+Post-change targeted retrieval timing for one identical explicit saved-link query was **1.42 seconds cold** and **14 milliseconds warm**. The warm result includes a cached embedding plus concurrent vector/FTS SQL. First-query latency remains dominated by the remote embedding provider, while repeated or fragmented queries benefit strongly from deduplication and caching.
 
-\* Pipecat logged `Bot started speaking` before its later TTFA metric on this turn; the transport event is used for the end-to-end value. This discrepancy is another reason to add application-level correlated timing.
+## 2. Current critical paths
 
-Other observations:
+### Direct turn
 
-- All three turns paid semantic/vector retrieval cost and returned no RAG context.
-- Prompt usage rose from 790 to 819 to 875 tokens. Normal conversation growth explains some of this, but retrieved developer messages are also appended permanently when present.
-- A background memory call hit Gemini free-tier quota (`429 RESOURCE_EXHAUSTED`) during the third turn. This call is derived-memory processing, not the foreground voice answer.
-- Session construction began at 10:31:49.188, the client connected at 10:31:50.041, and greeting audio began at 10:31:52.008: about **2.82 s** from bot construction or **1.97 s** after client connection.
+`browser audio → WebRTC → VAD/Smart Turn → Deepgram final transcript(s) → direct router → user aggregator waits for turn completion → Gemini → Deepgram TTS → WebRTC output`
 
-## 3. Current critical path
+No database or embedding call is now required for ordinary conversation. Remaining variance comes from speech finalization, LLM TTFB, TTS TTFA, and network/provider reconnects.
 
-For an authenticated user turn, the effective path is:
+### Explicit RAG or recall turn
 
-`audio → VAD/smart-turn → Deepgram final transcript → ContextRetrievalProcessor → (memory lookup || RAG embedding + vector SQL + FTS SQL) → user aggregator → Google LLM → Deepgram TTS → WebRTC output`
+`final transcript → route → optional filler → embedding API → vector SQL → FTS SQL → relevance filter/context formatting → user aggregator → Gemini → TTS`
 
-`ContextRetrievalProcessor` creates a detached task and deliberately withholds the transcription until both memory and RAG finish. Memory is cheap for non-recall turns because it has a deterministic recall gate. RAG does not have an equivalent pre-retrieval gate: `retrieve_rag_chunks()` embeds first, then performs vector and text searches, and only afterwards decides whether the result is relevant enough to inject.
+The 2.5-second deadline prevents unbounded waiting. Vector and FTS now execute concurrently after the embedding call, and identical normalized embeddings are deduplicated and cached.
 
-## 4. Prioritized recommendations
+### Tool turn
 
-### P0 — High-impact, low-risk changes
+`final transcript → Gemini tool decision → filler TTS → Tavily/DB tool → Gemini answer → answer TTS`
 
-#### 4.1 Route before semantic RAG
+The filler improves perceived responsiveness but does not reduce completion time. Tavily still uses a thread around its synchronous API, but the client is now reused.
 
-Add a deterministic, conservative pre-router before `embed_text()`. It should immediately skip retrieval for acknowledgements, greetings, assistant-identity/capability questions, and other conversational control turns. It should retrieve for explicit source/document/link/PDF language, lookup requests, and likely knowledge questions. Preserve recall by using a staged fallback:
+### Session startup
 
-1. Check a short-lived per-user cache indicating whether any ready RAG sources exist; skip all retrieval if none exist.
-2. Run cheap PostgreSQL FTS first for ambiguous turns.
-3. Run semantic embedding/vector search for explicit RAG intent, strong knowledge-seeking intent, or when lexical routing cannot decide.
+`POST /start → construct STT/TTS/LLM → memory authentication/conversation → concurrent facts/recent queries → optional prior context → bounded prompt → connect providers → greeting LLM → greeting TTS`
 
-This preserves semantic RAG where it can help while eliminating the measured 0.6–1.0 s waste on clearly irrelevant turns. The existing `is_rag_query()` is a useful starting point but should be expanded and tested against real transcripts before becoming the only gate.
+Memory hydration is still performed before pipeline execution, but independent facts/recent-message queries now overlap and prompt sections are bounded.
 
-#### 4.2 Give retrieval a strict latency budget
+## 3. Remaining findings
 
-Wrap turn retrieval in a configurable deadline, initially **250–400 ms**, and continue without dynamic context on expiry. Cancel and await child tasks cleanly. Log timeout/fallback as a metric, not an error. Static facts and recent conversation context are already loaded at session start, so ordinary conversation remains fully functional when dynamic retrieval misses its budget.
+### P0 — Fix before claiming stable latency
 
-For explicit document questions, a slightly larger budget or a short spoken filler can be used. Speak filler only if retrieval crosses a delay threshold; do not speak it immediately for work that may finish quickly.
+#### 3.1 Aggregate one user turn before routing, persistence, and timing
 
-#### 4.3 Preserve turn ordering and cancellation
+Deepgram can emit multiple finalized `TranscriptionFrame`s for one spoken turn. The current code treats every frame as a new latency turn, saves every fragment as a separate user message, clears dynamic context, and independently routes it. Smart Turn later combines the fragments for one LLM inference.
 
-Do not use an untracked `asyncio.create_task()` per transcription. Rapid turns can complete retrieval out of order and push older transcription after newer transcription; tasks can also outlive disconnect. Use a per-session task reference or ordered queue:
+Evidence from the logs:
 
-- assign a monotonically increasing turn ID;
-- cancel superseded retrieval when barge-in semantics make the old turn obsolete;
-- otherwise serialize delivery in turn order;
-- cancel and await the task during pipeline cleanup.
+- `What are top five documentaries of your` became turn 1;
+- `twenty twenty two according to the documents?` became turn 2;
+- inference occurred only after the second fragment and Smart Turn completion;
+- another direct utterance logged fragments at 12:08:48 and 12:08:50, but inference did not start until 12:08:52.928.
 
-#### 4.4 Make dynamic context turn-scoped
+This makes the dashboard inaccurate, fragments conversation history, and can launch redundant or stale retrieval tasks. Introduce a turn coordinator keyed by Pipecat user-turn start/stop events. Accumulate final transcript fragments, route once, persist once, assign one turn ID, and start end-to-end timing at last user audio/VAD stop rather than at each transcript.
 
-RAG and episodic-memory messages are currently added to the shared `LLMContext` and never removed. This increases token count, cost, and LLM latency over a long call and can make stale retrieved content influence later questions. Attach retrieval only to the current inference, or remove/tag the injected messages after `LLMFullResponseEndFrame`. Keep stable facts, summary, and recent transcript persistent; keep query-specific retrieval ephemeral.
+#### 3.2 Repair Alembic before any fresh or scaled deployment — completed
 
-### P1 — Stabilize memory and database work
+`3c5c3ec4e525_initial.py` contains only `drop_index()` operations in `upgrade()` and index creation in `downgrade()`. It does not create the application tables. A fresh database cannot be reliably built from migrations, and applying it to a legacy database removes:
 
-#### 4.5 Separate foreground and derived-memory provider budgets
+- RAG HNSW vector index;
+- RAG GIN full-text index;
+- RAG ownership/status indexes;
+- episodic-memory vector index.
 
-The background pipeline classifies every user message with Gemini, even turns such as “Okay, thank you.” It then may summarize and embed. Add a cheap deterministic fact-candidate gate before calling the memory LLM, coalesce summary work, and use a separate API project/key, rate limiter, and circuit breaker for derived memory. On 429, respect retry metadata and stop sending more classification work during the backoff window.
+The baseline, additive migrations, live indexes, timestamp types, and ORM index metadata are now synchronized. Docker applies migrations before starting the backend. A disposable empty-database migration test remains a useful CI addition.
 
-This protects foreground voice capacity and reduces cost without removing durable memory; likely durable statements still go through the existing classifier.
+#### 3.3 Finish end-to-end instrumentation
 
-#### 4.6 Enforce per-conversation job ordering
+The live panel is useful but currently measures `TranscriptionFrame → first TTSAudioRawFrame`, not speech stop → audio heard by the browser. It resets on transcript fragments and records generated TTS audio before `transport.output()`. It lacks:
 
-The in-memory queue has three global workers. User and assistant post-processing for the same conversation can execute concurrently, regenerate summaries from different snapshots, and upsert overlapping memory chunks. Partition work by conversation ID or use a keyed lock, and coalesce “update summary/chunk” jobs. Commit raw messages immediately, then process one derived state transition per conversation.
-
-The queue should also drain with `queue.join()` on graceful shutdown or durably persist work. Its current `stop()` cancels workers immediately and can discard queued memory/RAG work.
-
-#### 4.7 Avoid repeated full-conversation scans
-
-`update_conversation_summary_if_needed()` counts and then loads every message for each user and assistant message. Once thresholds are crossed it can regenerate a summary repeatedly. Store message/character counters, summarize incrementally at checkpoints, and load only the unsummarized suffix. Build episodic chunks from explicit message windows rather than re-querying the entire conversation.
-
-#### 4.8 Optimize hybrid retrieval execution
-
-After routing is fixed, reduce latency on true RAG turns:
-
-- cache normalized query embeddings for short periods;
-- reuse embedding clients rather than constructing Google/OpenAI clients per call;
-- run vector and FTS branches concurrently using separate sessions/connections, or benchmark a single SQL query that unions/ranks both branches;
-- batch ingestion embeddings so ingestion does not compete with live retrieval;
-- set database statement timeouts below the overall retrieval budget;
-- measure pool wait separately from SQL execution.
-
-Do not increase database pool sizes blindly: the current 20 + 10 overflow connections per process can overload PostgreSQL when replicas are added.
-
-### P2 — Provider and transport tuning after the critical path is bounded
-
-#### 4.9 Measure and tune final-transcript delay
-
-The third turn took about 1.40 s from smart EOT to the logged final STT event versus 0.19–0.31 s for the first two. Record speech-stop audio time, VAD decision, smart-turn completion, interim/final transcript arrival, and provider connection state with one session/turn ID. Then test Deepgram endpointing/utterance-end configuration against interruptions and sentence completeness. Do not lower endpointing globally without a corpus-based false-cutoff test.
-
-#### 4.10 Reduce TTS start variance
-
-Deepgram TTS TTFA ranged from 0.319–0.508 s and one turn had 205 ms leading silence. Update to the current settings API (the log shows the `voice` argument is deprecated), explicitly configure latency-relevant audio/stream settings, and measure first text frame → request sent → first provider audio → first transport audio. Keep streaming sentence aggregation, but test shorter first clauses so the assistant begins speaking sooner without producing choppy prosody.
-
-#### 4.11 Parallelize session initialization safely
-
-`load_memory_bundle()` runs before the worker/pipeline is started and contributes to call startup. Fetch independent facts, recent messages, current summary, and prior-conversation context concurrently where database capacity permits. Cache stable facts briefly per user. Initialize provider objects and the memory bundle concurrently only if provider constructors/connectors are safe to do so. Target greeting audio p95 below 1.5–2.0 s after signaling completes.
-
-#### 4.12 Control prompt size
-
-The initial prompt contains stable facts, current summary/recent messages, prior-conversation transcript, tools, and system instructions. Apply explicit token budgets to each section, prefer a compact prior summary over a verbatim prior transcript, and cap tool schemas/context. Track prompt tokens per turn and alert on abnormal growth. This retains continuity while keeping LLM TTFB stable over long sessions.
-
-## 5. Instrumentation required before further provider changes
-
-Add one structured event per boundary with `session_id`, `conversation_id`, `turn_id`, and monotonic timestamp:
-
-- speech start / last audio packet / VAD stop / smart-turn complete;
-- final STT received;
-- route decision and reason;
+- last user audio/VAD stop and Smart Turn decision;
 - embedding start/end;
-- DB pool wait and vector/FTS start/end;
-- context accepted/skipped/timed out;
-- LLM request and first token;
-- first TTS text, provider first audio, transport first audio;
-- interruption received and output audio stopped.
+- DB pool wait, vector SQL, and FTS SQL;
+- LLM request start versus first text;
+- transport enqueue/send and browser playback;
+- reconnect state and dropped/buffered audio;
+- p50/p95 aggregation persisted across sessions.
 
-Primary SLOs should be segmented by no-retrieval, RAG, memory recall, and tool turns. A useful initial target for no-tool/no-retrieval turns is final-STT-to-first-audio **p50 < 900 ms, p95 < 1.5 s**. Also track end-of-speech-to-first-audio, because that is what the user perceives.
+Without these boundaries, the dashboard can show a healthy number while the user waited several seconds before final transcription or browser playback.
 
-## 6. Suggested implementation sequence
+### P1 — High-value latency improvements
 
-1. Add correlated latency spans and a replayable transcript benchmark.
-2. Add RAG pre-routing, ready-source cache, and a retrieval deadline.
-3. Replace detached retrieval with ordered/cancellable session state.
-4. Make retrieved context turn-scoped.
-5. Gate, rate-limit, and serialize derived-memory work per conversation.
-6. Parallelize/merge vector and FTS retrieval and reuse embedding clients.
-7. Tune STT endpointing and TTS settings using recorded utterances.
-8. Optimize startup memory loading and prompt budgets.
+#### 3.4 Reuse provider clients and cache query embeddings — completed
 
-## 7. Validation findings from this review
+Google/OpenAI clients are reused, and normalized embeddings share in-flight requests plus a bounded TTL/LRU cache keyed by provider, model, content, and dimension.
 
-- Graphify was stale/broken (`graphifyy` 0.8.14 behind the installed skill); its tool environment was updated and the code graph rebuilt to **444 nodes, 841 edges, 35 communities**.
-- Backend tests currently fail during collection because `tests/test_rag.py` imports `RollingVoiceQueryBuffer` from `main`, but the class moved to `core.processors`.
-- Frontend lint currently fails on three unused imports in `Sidebar.jsx` and `TranscriptPanel.jsx`.
-- The Deepgram TTS constructor emits a deprecation warning for the `voice` argument.
+Expected gain is smaller than provider network latency but consistent, and it reduces connection churn under concurrent calls.
 
-These findings are appended to `issues.md`; no application behavior was changed during this audit.
+#### 3.5 Parallelize or combine hybrid retrieval — completed
+
+After embedding returns, vector and FTS branches now run concurrently in independent async sessions. The application-level 2.5-second deadline remains the hard bound.
+
+At the current 49 RAG chunks, SQL time is negligible. This becomes important at tens or hundreds of thousands of chunks; correct HNSW/GIN indexes are a prerequisite.
+
+#### 3.6 Tune Smart Turn from recorded speech, not guesses — configurable 1.5 s default applied
+
+`SMART_TURN_STOP_SECS` now defaults to 1.5 seconds instead of Pipecat's 3-second default. Validate false cutoffs and barge-ins against real utterances, pauses, accents, and noisy audio before lowering it further.
+
+#### 3.7 Parallelize and budget session hydration — completed
+
+After token/conversation ownership is established, active facts and recent messages now load concurrently. Explicit character caps apply to:
+
+- facts;
+- current summary;
+- recent messages;
+- prior summary/transcript.
+
+Prior-conversation lookup remains conditional and sequential only for a newly empty conversation. A tokenizer-aware total budget could further refine the current character caps.
+
+#### 3.8 Keep inspection/transcript payloads off the inference gate — completed
+
+The processor now installs dynamic context and releases the user transcription before sending/persisting `rag_call` inspection data. Persisting bounded previews instead of complete selected content remains an optional storage reduction.
+
+#### 3.9 Batch background ingestion embeddings — completed with bounded concurrency
+
+Link/PDF ingestion now uses configurable bounded concurrency (default four) instead of one request at a time. Provider-native batch APIs and a separate ingestion quota remain possible future improvements.
+
+### P2 — Smaller or workload-dependent gains
+
+#### 3.10 Tune transport output buffering — initial reduction applied
+
+Output buffering now defaults to two 10-ms chunks instead of four and is configurable with `AUDIO_OUT_10MS_CHUNKS`. Validate underruns and jitter during longer calls before lowering it further.
+
+#### 3.11 Reuse the Tavily client — completed
+
+Tavily now reuses its client while keeping the synchronous SDK call in a worker thread. A native async transport remains a secondary improvement if the SDK supports one.
+
+#### 3.12 Warm only what affects first-call latency
+
+The first PDF ingestion loads Docling/OCR and embedding dependencies, but voice startup does not proactively warm all provider paths. Warm the configured embedding path and local Smart Turn model at application startup only if memory/CPU limits permit. Avoid warming Docling in the voice process; ingestion should ultimately be a separate worker service.
+
+## 4. What should not be optimized away
+
+- Do not remove Smart Turn and rely only on an aggressively short VAD timeout.
+- Do not skip RAG for explicit saved-source questions.
+- Do not remove relevance checks merely to return faster.
+- Do not put derived-memory LLM work back into the foreground path.
+- Do not increase DB pool size before measuring pool wait and PostgreSQL capacity.
+- Do not switch providers based on a few outliers while Deepgram reconnects/turn boundaries remain unresolved.
+
+## 5. Recommended implementation order
+
+1. Build a turn-level transcript coordinator and correct latency semantics.
+2. Replace the broken Alembic baseline and assert required indexes in CI.
+3. Add speech-stop, retrieval-substage, transport, and browser-playback timing.
+4. Make Smart Turn silence configurable and run a recorded-utterance benchmark.
+5. Reuse embedding/memory clients and add a normalized embedding cache.
+6. Parallelize or combine vector and FTS retrieval with SQL timeouts.
+7. Parallelize session hydration and enforce prompt budgets.
+8. Move RAG inspection payload delivery behind inference and batch ingestion embeddings.
+9. Benchmark transport chunk size and Tavily client reuse.
+
+## 6. Suggested SLOs
+
+Measure both end-of-speech and final-transcript latency, segmented by direct/RAG/tool/reconnect:
+
+| Metric | Initial target |
+|---|---:|
+| Direct final transcript → browser audio p50 | < 1.2 s |
+| Direct final transcript → browser audio p95 | < 1.8 s |
+| Direct end of speech → browser audio p50 | < 1.5 s |
+| Direct end of speech → browser audio p95 | < 2.5 s |
+| RAG final transcript → browser answer audio p50 | < 2.3 s |
+| RAG retrieval p95 | < 1.2 s, hard timeout 2.5 s |
+| Tool acknowledgement audio | < 1.5 s |
+| Session signal complete → greeting audio p95 | < 2.0 s |
+| STT reconnect recovery p95 | < 3.0 s with no lost completed turn |
+
+## 7. Validation result
+
+- Backend: **34 tests passed**.
+- Frontend: ESLint passed.
+- Frontend: production build passed.
+- Live database: 49 RAG chunks, 11 messages, 1 RAG source at inspection time.
+- Alembic is at `20260717_schema_sync` head and reports no model/schema drift.
+- Graphify was used for the architecture trace and refreshed after this audit.
+
+The project is in a much healthier state than at the first review. The next major gains will come from treating a spoken turn—not each transcript fragment—as the unit of routing and measurement, then fixing migration/index reproducibility and tuning turn completion with recorded audio.

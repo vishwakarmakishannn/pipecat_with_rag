@@ -1,6 +1,4 @@
-import React from 'react';
-import { Plus, LogOut, Brain, MessageSquare, Trash2, Link as LinkIcon, Upload, RefreshCw, FileText } from 'lucide-react';
-import { fetchWithAuth } from '../utils/api';
+import { Plus, LogOut, Brain, MessageSquare, Trash2, Link as LinkIcon, Upload, RefreshCw, FileText, Activity, Database } from 'lucide-react';
 
 export default function Sidebar({
   // Memory props
@@ -34,8 +32,23 @@ export default function Sidebar({
   setLinkUrl,
   addRagLink,
   fileError,
-  deleteRagFile
+  deleteRagFile,
+  inspectRagFile,
+  latencyStats,
+  clearLatencyStats
 }) {
+
+  const formatLatency = (value) => {
+    if (value == null) return '—';
+    return value < 1000 ? `${Math.round(value)} ms` : `${(value / 1000).toFixed(2)} s`;
+  };
+
+  const average = (items) => items.length
+    ? items.reduce((sum, item) => sum + item.answer_audio_ms, 0) / items.length
+    : null;
+  const directTurns = latencyStats.filter((item) => !item.with_tools);
+  const toolTurns = latencyStats.filter((item) => item.with_tools);
+  const latestLatency = latencyStats.at(-1);
 
   const formatFileSize = (sizeBytes) => {
     if (!sizeBytes) return '0 KB';
@@ -223,6 +236,14 @@ export default function Sidebar({
                     <div className="file-actions">
                       <span className="source-type">{(file.source_type || 'pdf') === 'link' ? 'Link' : 'PDF'}</span>
                       <span className={`file-status ${file.status}`}>{file.status}</span>
+                      <button
+                        className="file-action-btn file-chunks"
+                        onClick={() => inspectRagFile(file)}
+                        disabled={file.status !== 'ready' || !file.chunk_count}
+                        title={file.chunk_count ? 'Inspect stored chunks' : 'No stored chunks'}
+                      >
+                        <Database size={14} />
+                      </button>
                       <button className="delete-btn file-delete" onClick={() => deleteRagFile(file.id)} title="Delete file">
                         <Trash2 size={14} />
                       </button>
@@ -236,6 +257,23 @@ export default function Sidebar({
           </div>
         )}
       </div>
+      {sidebarTab === 'chats' ? (
+        <div className="latency-panel">
+          <div className="latency-title">
+            <span><Activity size={14} /> Live latency</span>
+            <button onClick={clearLatencyStats} disabled={!latencyStats.length}>Reset</button>
+          </div>
+          <div className="latency-latest">
+            <span>Latest {latestLatency ? `· ${latestLatency.category}` : ''}</span>
+            <strong>{formatLatency(latestLatency?.answer_audio_ms)}</strong>
+          </div>
+          <div className="latency-grid">
+            <div><span>Session avg · no tools</span><strong>{formatLatency(average(directTurns))}</strong><small>{directTurns.length} turns</small></div>
+            <div><span>Session avg · tools</span><strong>{formatLatency(average(toolTurns))}</strong><small>{toolTurns.length} turns</small></div>
+          </div>
+          <div className="latency-footnote">Final transcript → first answer audio</div>
+        </div>
+      ) : null}
     </div>
   );
 }
