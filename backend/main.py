@@ -28,12 +28,12 @@ import time
 from dotenv import load_dotenv
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.frames.frames import (
     Frame,
     LLMFullResponseEndFrame,
-    LLMRunFrame,
     LLMTextFrame,
     OutputTransportMessageFrame,
     TranscriptionFrame,
@@ -62,7 +62,11 @@ from services.memory import build_memory_messages, build_turn_memory_context, lo
 from core.memory_config import MEMORY_EMBEDDING_DIMENSION
 from services.rag import build_rag_context_with_payload, is_rag_query
 from core.rag_config import RAG_VOICE_QUERY_WINDOW_SECONDS
-from tools.tavily import tavily_search
+from core.voice_config import load_endpointing_config, startup_greeting
+from core.voice_services import initialize_voice_services
+from core.audio_config import audio_input_sample_rate, audio_out_10ms_chunks, audio_output_sample_rate
+from core.admission import voice_admission
+from tools.tavily import run_web_search, tavily_search
 from tools.raise_issue import raise_issue
 
 load_dotenv(override=True)
@@ -71,9 +75,12 @@ from core.processors import (
     ConversationMemoryProcessor,
     ToolFillerProcessor,
     ContextRetrievalProcessor,
+    LeadingSilenceTrimmerProcessor,
     TurnContextCleanupProcessor,
     TurnLatencyState,
     LatencyBoundaryProcessor,
+    BoundedContextProcessor,
+    ToolRoutingProcessor,
 )
 
 
@@ -89,14 +96,9 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     """
     logger.info("Starting bot")
 
-    # Speech-to-Text service
-    stt = get_stt()
-
-    # Text-to-Speech service
-    tts = get_tts()
-
-    # LLM service
-    llm = get_llm()
+    # Constructors may load ONNX/Piper models or initialize provider clients.
+    # They are independent, so keep them off the event loop and overlap them.
+    stt, tts, llm = await initialize_voice_services(get_stt, get_tts, get_llm)
 
     memory_bundle = await load_memory_bundle(runner_args.body)
     memory_messages = build_memory_messages(memory_bundle)
@@ -116,19 +118,54 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
 
     context = LLMContext(
         messages=memory_messages,
-        tools=[tavily_search, raise_issue]
+        tools=[]
+    )
+    context_window = BoundedContextProcessor(
+        context,
+        protected_messages=memory_messages,
+        max_messages=int(os.getenv("VOICE_CONTEXT_MAX_MESSAGES", "24")),
+        max_chars=int(os.getenv("VOICE_CONTEXT_MAX_CHARS", "18000")),
+        name="BoundedContext",
     )
     latency_state = TurnLatencyState(session_id=getattr(runner_args, "session_id", None))
-    context_retrieval = ContextRetrievalProcessor(user_id, conversation_id, context, latency_state, name="ContextRetrieval")
+    context_retrieval = ContextRetrievalProcessor(
+        user_id,
+        conversation_id,
+        context,
+        latency_state,
+        web_search=run_web_search,
+        name="ContextRetrieval",
+    )
+    tool_router = ToolRoutingProcessor(
+        context,
+        search_tool=tavily_search,
+        issue_tool=raise_issue,
+        retrieval=context_retrieval,
+        latency_state=latency_state,
+        name="ToolRouter",
+    )
     context_cleanup = TurnContextCleanupProcessor(
         context_retrieval, latency_state, name="TurnContextCleanup"
     )
-    smart_turn_stop_secs = float(os.getenv("SMART_TURN_STOP_SECS", "1.5"))
+    endpointing = load_endpointing_config()
+    logger.info(
+        "voice_endpointing vad_confidence={} vad_start_secs={} vad_stop_secs={} "
+        "vad_min_volume={} smart_turn_stop_secs={}",
+        endpointing.vad_confidence,
+        endpointing.vad_start_secs,
+        endpointing.vad_stop_secs,
+        endpointing.vad_min_volume,
+        endpointing.smart_turn_stop_secs,
+    )
     user_turn_strategies = UserTurnStrategies(
         stop=[
             TurnAnalyzerUserTurnStopStrategy(
                 turn_analyzer=LocalSmartTurnAnalyzerV3(
-                    params=SmartTurnParams(stop_secs=smart_turn_stop_secs)
+                    params=SmartTurnParams(
+                        stop_secs=endpointing.smart_turn_stop_secs,
+                        pre_speech_ms=endpointing.smart_turn_pre_speech_ms,
+                        max_duration_secs=endpointing.smart_turn_max_duration_secs,
+                    )
                 )
             )
         ]
@@ -136,10 +173,21 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(),
+            vad_analyzer=SileroVADAnalyzer(
+                params=VADParams(
+                    confidence=endpointing.vad_confidence,
+                    start_secs=endpointing.vad_start_secs,
+                    stop_secs=endpointing.vad_stop_secs,
+                    min_volume=endpointing.vad_min_volume,
+                )
+            ),
             user_turn_strategies=user_turn_strategies,
         ),
     )
+
+    @user_aggregator.event_handler("on_user_turn_started")
+    async def reset_query_scoped_turn_state(aggregator, strategy):
+        context_retrieval.start_user_turn()
 
     @user_aggregator.event_handler("on_user_turn_stopped")
     async def persist_complete_user_turn(aggregator, strategy, message):
@@ -164,12 +212,16 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
             LatencyBoundaryProcessor(latency_state, "stt", name="PostSTTLatency"),
             context_retrieval,
             user_aggregator,
+            LatencyBoundaryProcessor(latency_state, "turn", name="PostTurnLatency"),
+            tool_router,
+            context_window,
             llm,
             LatencyBoundaryProcessor(latency_state, "llm", name="PostLLMLatency"),
             context_cleanup,
             tool_filler,
             assistant_memory,
             tts,
+            LeadingSilenceTrimmerProcessor(name="LeadingSilenceTrimmer"),
             LatencyBoundaryProcessor(latency_state, "tts", name="PostTTSLatency"),
             transport.output(),
             assistant_aggregator,
@@ -190,15 +242,23 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
 
     @worker.rtvi.event_handler("on_client_ready")
     async def on_client_ready(rtvi):
-        # Kick off the conversation
-        greeting_instruction = "Just say hello."
-        if memory_bundle and (memory_bundle.summary or memory_bundle.recent_messages):
-            greeting_instruction = (
-                "Briefly greet the user and continue naturally with awareness of the "
-                "loaded conversation context. Do not recap unless the user asks."
-            )
-        context.add_message({"role": "developer", "content": greeting_instruction})
-        await worker.queue_frames([LLMRunFrame()])
+        # A greeting does not require model reasoning. Keeping it out of the
+        # LLM path removes startup TTFT and avoids a permanent prompt message.
+        startup_frames = []
+        if conversation_id:
+            startup_frames.append(OutputTransportMessageFrame({
+                "label": "rtvi-ai",
+                "type": "server-message",
+                "data": {
+                    "type": "conversation_ready",
+                    "payload": {"conversation_id": conversation_id},
+                },
+            }))
+        greeting = startup_greeting()
+        if greeting:
+            startup_frames.append(TTSSpeakFrame(greeting, append_to_context=False))
+        if startup_frames:
+            await worker.queue_frames(startup_frames)
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
@@ -218,26 +278,45 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
 async def bot(runner_args: RunnerArguments):
     """Main bot entry point."""
 
-    output_chunks = int(os.getenv("AUDIO_OUT_10MS_CHUNKS", "2"))
-    transport_params = {
-        "daily": lambda: DailyParams(
-            audio_in_enabled=True,
-            audio_out_enabled=True,
-            audio_out_10ms_chunks=output_chunks,
-        ),
-        "webrtc": lambda: TransportParams(
-            audio_in_enabled=True,
-            audio_out_enabled=True,
-            audio_out_10ms_chunks=output_chunks,
-        ),
-    }
+    if not await voice_admission.try_acquire():
+        logger.warning(
+            "voice_admission status=rejected active={} limit={} session={}",
+            voice_admission.active,
+            voice_admission.limit,
+            getattr(runner_args, "session_id", None),
+        )
+        raise RuntimeError("voice session capacity reached")
 
-    transport = await create_transport(runner_args, transport_params)
+    try:
+        output_chunks = audio_out_10ms_chunks()
+        input_sample_rate = audio_input_sample_rate()
+        output_sample_rate = audio_output_sample_rate()
+        transport_params = {
+            "daily": lambda: DailyParams(
+                audio_in_enabled=True,
+                audio_in_sample_rate=input_sample_rate,
+                audio_out_enabled=True,
+                audio_out_sample_rate=output_sample_rate,
+                audio_out_10ms_chunks=output_chunks,
+            ),
+            "webrtc": lambda: TransportParams(
+                audio_in_enabled=True,
+                audio_in_sample_rate=input_sample_rate,
+                audio_out_enabled=True,
+                audio_out_sample_rate=output_sample_rate,
+                audio_out_10ms_chunks=output_chunks,
+            ),
+        }
 
-    await run_bot(transport, runner_args)
+        transport = await create_transport(runner_args, transport_params)
+        await run_bot(transport, runner_args)
+    finally:
+        await voice_admission.release()
 
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
+from sqlalchemy import text
+from core.database import engine
 health_router = APIRouter(tags=["health"])
 
 @health_router.get("/health/live")
@@ -246,14 +325,29 @@ async def liveness_probe():
 
 @health_router.get("/health/ready")
 async def readiness_probe():
-    # In a real app, you might check DB connectivity here
-    return {"status": "ready"}
+    from core.task_queue import task_queue
+
+    if not task_queue.is_running:
+        raise HTTPException(status_code=503, detail="background workers are not ready")
+
+    async def check_database():
+        async with engine.connect() as connection:
+            await connection.execute(text("SELECT 1"))
+
+    try:
+        await asyncio.wait_for(check_database(), timeout=1.5)
+    except Exception as exc:
+        logger.warning("readiness database check failed: {}", exc)
+        raise HTTPException(status_code=503, detail="database is not ready") from exc
+
+    return {"status": "ready", "database": "ready", "workers": "ready"}
 
 
 
 if __name__ == "__main__":
     from pipecat.runner.run import app, main
     from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import JSONResponse
     import os
 
     allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:80")
@@ -266,6 +360,20 @@ if __name__ == "__main__":
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.middleware("http")
+    async def reject_over_capacity(request, call_next):
+        path = request.url.path
+        starts_voice = request.method == "POST" and (
+            path == "/start" or path == "/api/offer" or path.endswith("/api/offer")
+        )
+        if starts_voice and not voice_admission.has_capacity:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "voice capacity reached; retry shortly"},
+                headers={"Retry-After": "2"},
+            )
+        return await call_next(request)
 
     from api.auth import router as auth_router
     from api.history import router as history_router

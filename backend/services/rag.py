@@ -5,6 +5,8 @@ import uuid
 import os
 import re
 import socket
+import time
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,7 +19,7 @@ from loguru import logger
 from sqlalchemy import delete, func, literal_column
 from sqlalchemy.future import select
 
-from core.database import AsyncSessionLocal
+from core.database import AsyncSessionLocal, VoiceSessionLocal
 from services.memory import embed_text
 from core.models import RagChunk, RagFile
 from core.rag_config import (
@@ -54,6 +56,29 @@ RAG_QUERY_PATTERNS = [
     r"\bwhat does (it|the (file|document|pdf|link|web\s*page|website|site|article|source)) say\b",
     r"\bsummarize\s+(my\s+|the\s+)?(pdfs?|documents?|files?|papers?|reports?|links?|web\s*pages?|websites?|articles?|sources?)\b",
 ]
+
+_RAG_RESULT_CACHE_MAX = int(os.getenv("RAG_RESULT_CACHE_SIZE", "256"))
+_RAG_RESULT_CACHE_TTL_SECONDS = float(os.getenv("RAG_RESULT_CACHE_TTL_SECONDS", "120"))
+_rag_corpus_versions: dict[int, int] = defaultdict(int)
+_rag_result_cache: OrderedDict[tuple, tuple[float, tuple]] = OrderedDict()
+_rag_result_inflight: dict[tuple, asyncio.Task] = {}
+_EMBEDDING_UNSET = object()
+
+
+def _normalized_cache_query(query: str) -> str:
+    return re.sub(r"\s+", " ", (query or "").strip().lower())
+
+
+def bump_rag_corpus_version(user_id: int) -> None:
+    _rag_corpus_versions[user_id] += 1
+    for key in [key for key in _rag_result_cache if key[0] == user_id]:
+        _rag_result_cache.pop(key, None)
+
+
+def clear_rag_result_cache() -> None:
+    _rag_result_cache.clear()
+    _rag_result_inflight.clear()
+    _rag_corpus_versions.clear()
 
 
 @dataclass
@@ -504,6 +529,7 @@ async def process_rag_file(file_id: int) -> None:
             rag_file.error = None
             rag_file.updated_at = datetime.now(timezone.utc)
             await db.commit()
+            bump_rag_corpus_version(rag_file.user_id)
             logger.info(f"Processed RAG source {rag_file.id} with {len(parsed_chunks)} chunks")
         except Exception as exc:
             logger.warning(f"RAG source processing failed for source={file_id}: {exc}")
@@ -515,8 +541,10 @@ async def process_rag_file(file_id: int) -> None:
 
 async def delete_rag_file_record(rag_file: RagFile, db) -> None:
     storage_path = rag_file.storage_path
+    user_id = rag_file.user_id
     await db.delete(rag_file)
     await db.commit()
+    bump_rag_corpus_version(user_id)
     if storage_path:
         from core.storage import storage_client
         object_name = storage_path if storage_path.startswith("local://") else "/".join(storage_path.split("/")[-2:])
@@ -576,7 +604,7 @@ def _rag_stats(chunks: list[RetrievedRagChunk]) -> tuple[int, float | None, floa
 
 
 async def _retrieve_vector_candidates(user_id: int, embedding: list[float]):
-    async with AsyncSessionLocal() as db:
+    async with VoiceSessionLocal() as db:
         distance = RagChunk.embedding.cosine_distance(embedding).label("distance")
         result = await db.execute(
             select(RagChunk, RagFile, distance)
@@ -597,7 +625,7 @@ async def _retrieve_text_candidates(user_id: int, query: str):
     or_query = " OR ".join(w for w in re.split(r"\s+", query) if w) or query
     ts_query = func.websearch_to_tsquery(literal_column("'english'"), or_query)
     text_rank = func.ts_rank_cd(RagChunk.search_vector, ts_query).label("text_rank")
-    async with AsyncSessionLocal() as db:
+    async with VoiceSessionLocal() as db:
         result = await db.execute(
             select(RagChunk, RagFile, text_rank)
             .join(RagFile, RagFile.id == RagChunk.file_id)
@@ -614,19 +642,36 @@ async def _retrieve_text_candidates(user_id: int, query: str):
         return result.all()
 
 
-async def retrieve_rag_chunks(
+async def _retrieve_rag_chunks_uncached(
     user_id: int,
     query: str,
     top_k: int = RAG_RETRIEVAL_TOP_K,
     force: bool = False,
+    query_embedding=_EMBEDDING_UNSET,
 ) -> list[RetrievedRagChunk]:
     merged: dict[int, dict[str, Any]] = {}
 
-    embedding = await embed_text(query)
-    vector_rows, text_rows = await asyncio.gather(
-        _retrieve_vector_candidates(user_id, embedding) if embedding else asyncio.sleep(0, result=[]),
-        _retrieve_text_candidates(user_id, query),
-    )
+    # Lexical retrieval has no embedding dependency. Start it immediately so
+    # remote embedding latency and PostgreSQL FTS latency overlap.
+    text_task = asyncio.create_task(_retrieve_text_candidates(user_id, query))
+    try:
+        if query_embedding is _EMBEDDING_UNSET:
+            embedding = await embed_text(query)
+        elif isinstance(query_embedding, asyncio.Future) or asyncio.iscoroutine(query_embedding):
+            embedding = await query_embedding
+        else:
+            embedding = query_embedding
+        vector_rows, text_rows = await asyncio.gather(
+            _retrieve_vector_candidates(user_id, embedding)
+            if embedding
+            else asyncio.sleep(0, result=[]),
+            text_task,
+        )
+    except BaseException:
+        if not text_task.done():
+            text_task.cancel()
+        await asyncio.gather(text_task, return_exceptions=True)
+        raise
     for rank, (chunk, rag_file, _distance) in enumerate(vector_rows, start=1):
         similarity = _vector_similarity(_distance)
         item = merged.setdefault(
@@ -719,6 +764,61 @@ async def retrieve_rag_chunks(
     return selected[:top_k]
 
 
+async def retrieve_rag_chunks(
+    user_id: int,
+    query: str,
+    top_k: int = RAG_RETRIEVAL_TOP_K,
+    force: bool = False,
+    query_embedding=_EMBEDDING_UNSET,
+) -> list[RetrievedRagChunk]:
+    if force or _RAG_RESULT_CACHE_MAX <= 0 or _RAG_RESULT_CACHE_TTL_SECONDS <= 0:
+        return await _retrieve_rag_chunks_uncached(
+            user_id,
+            query,
+            top_k=top_k,
+            force=force,
+            query_embedding=query_embedding,
+        )
+
+    key = (
+        user_id,
+        _rag_corpus_versions[user_id],
+        _normalized_cache_query(query),
+        top_k,
+    )
+    now = time.monotonic()
+    cached = _rag_result_cache.get(key)
+    if cached and now - cached[0] <= _RAG_RESULT_CACHE_TTL_SECONDS:
+        _rag_result_cache.move_to_end(key)
+        return list(cached[1])
+    if cached:
+        _rag_result_cache.pop(key, None)
+
+    task = _rag_result_inflight.get(key)
+    if task is None:
+        task = asyncio.create_task(
+            _retrieve_rag_chunks_uncached(
+                user_id,
+                query,
+                top_k=top_k,
+                force=False,
+                query_embedding=query_embedding,
+            )
+        )
+        _rag_result_inflight[key] = task
+    try:
+        result = await task
+    finally:
+        if task.done() and _rag_result_inflight.get(key) is task:
+            _rag_result_inflight.pop(key, None)
+
+    _rag_result_cache[key] = (time.monotonic(), tuple(result))
+    _rag_result_cache.move_to_end(key)
+    while len(_rag_result_cache) > _RAG_RESULT_CACHE_MAX:
+        _rag_result_cache.popitem(last=False)
+    return list(result)
+
+
 def _format_pages(chunk: RetrievedRagChunk) -> str:
     if chunk.source_type == "link":
         label = chunk.title or chunk.site_name or chunk.filename
@@ -784,7 +884,7 @@ def build_rag_call_payload(query: str, chunks: list[RetrievedRagChunk]) -> dict[
                     "page_start": chunk.page_start,
                     "page_end": chunk.page_end,
                     "heading_path": chunk.heading_path,
-                    "content": chunk.content,
+                    "content": _truncate(chunk.content, 240),
                     "score": chunk.score,
                     "vector_similarity": chunk.vector_similarity,
                     "text_rank": chunk.text_rank,
@@ -799,11 +899,16 @@ def build_rag_call_payload(query: str, chunks: list[RetrievedRagChunk]) -> dict[
 async def build_rag_context_with_payload(
     user_id: int | None,
     query: str,
+    query_embedding=_EMBEDDING_UNSET,
 ) -> tuple[str | None, dict[str, Any] | None]:
     if not user_id:
         return None, None
     try:
-        chunks = await retrieve_rag_chunks(user_id, query)
+        chunks = await retrieve_rag_chunks(
+            user_id,
+            query,
+            query_embedding=query_embedding,
+        )
     except Exception as exc:
         logger.warning(f"RAG retrieval failed: {exc}")
         return None, None
@@ -814,6 +919,14 @@ async def build_rag_context_with_payload(
     return context, build_rag_call_payload(query, chunks)
 
 
-async def build_rag_context(user_id: int | None, query: str) -> str | None:
-    context, _payload = await build_rag_context_with_payload(user_id, query)
+async def build_rag_context(
+    user_id: int | None,
+    query: str,
+    query_embedding=_EMBEDDING_UNSET,
+) -> str | None:
+    context, _payload = await build_rag_context_with_payload(
+        user_id,
+        query,
+        query_embedding=query_embedding,
+    )
     return context

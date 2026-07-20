@@ -1022,20 +1022,13 @@
   background: #f8fafc;
 }
 
-.latency-title, .latency-latest, .latency-grid > div {
+.latency-title, .latency-latest {
   display: flex;
   align-items: center;
 }
 
-.latency-title { justify-content: space-between; color: #475569; font-size: 0.78rem; font-weight: 700; }
+.latency-title { color: #475569; font-size: 0.78rem; font-weight: 700; }
 .latency-title > span { display: flex; align-items: center; gap: 6px; }
-.latency-title button { padding: 2px 6px; border: 0; background: transparent; color: #7c3aed; font-size: 0.66rem; cursor: pointer; }
-.latency-title button:disabled { color: #cbd5e1; cursor: default; }
 .latency-latest { justify-content: space-between; margin: 9px 0; font-size: 0.78rem; color: #64748b; }
 .latency-latest strong { color: #7c3aed; font-size: 1rem; }
-.latency-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-.latency-grid > div { align-items: flex-start; flex-direction: column; padding: 8px; border-radius: 8px; background: white; }
-.latency-grid span { color: #64748b; font-size: 0.68rem; }
-.latency-grid strong { color: #1e293b; font-size: 0.84rem; margin-top: 2px; }
-.latency-grid small { color: #94a3b8; font-size: 0.62rem; }
 .latency-footnote { margin-top: 8px; color: #94a3b8; font-size: 0.62rem; text-align: center; }

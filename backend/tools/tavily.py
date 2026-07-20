@@ -2,6 +2,7 @@ import os
 import asyncio
 from pipecat.services.llm_service import FunctionCallParams
 from tavily import TavilyClient
+from core.tool_config import tool_timeout_seconds
 
 _tavily_client = None
 
@@ -12,14 +13,13 @@ def _get_tavily_client():
         _tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
     return _tavily_client
 
-async def tavily_search(params: FunctionCallParams, query: str):
-    """Search the web using Tavily.
-    
-    Args:
-        query: The search query.
-    """
+async def run_web_search(query: str) -> dict:
+    """Execute one bounded web search and return a compact provider-neutral result."""
     if not os.getenv("TAVILY_API_KEY"):
-        raise ValueError("TAVILY_API_KEY is not configured")
+        return {
+            "status": "unavailable",
+            "message": "Web search is not configured. Answer without search or tell the user it is unavailable.",
+        }
 
     def run_search():
         client = _get_tavily_client()
@@ -31,8 +31,22 @@ async def tavily_search(params: FunctionCallParams, query: str):
             include_raw_content=False,
         )
     
-    result = await asyncio.to_thread(run_search)
-    compact_result = {
+    try:
+        async with asyncio.timeout(tool_timeout_seconds()):
+            result = await asyncio.to_thread(run_search)
+    except TimeoutError:
+        return {
+            "status": "timeout",
+            "message": "Web search timed out. Give a brief fallback answer and disclose that live results were unavailable.",
+        }
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return {
+            "status": "error",
+            "message": "Web search failed. Continue without live results.",
+        }
+    return {
         "query": result.get("query", query),
         "answer": result.get("answer"),
         "results": [
@@ -44,4 +58,8 @@ async def tavily_search(params: FunctionCallParams, query: str):
             for item in result.get("results", [])[:3]
         ],
     }
-    await params.result_callback(compact_result)
+
+
+async def tavily_search(params: FunctionCallParams, query: str):
+    """Search the web using Tavily through Pipecat's function-call contract."""
+    await params.result_callback(await run_web_search(query))

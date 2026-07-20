@@ -1,7 +1,9 @@
 import re
+import asyncio
 from pipecat.services.llm_service import FunctionCallParams
-from core.database import AsyncSessionLocal
+from core.database import VoiceSessionLocal
 from core.models import Issue
+from core.tool_config import tool_timeout_seconds
 
 async def raise_issue(
     params: FunctionCallParams,
@@ -39,17 +41,33 @@ async def raise_issue(
         await params.result_callback({"status": "error", "message": error_msg})
         return
 
-    async with AsyncSessionLocal() as session:
-        new_issue = Issue(
-            cust_id=cust_id,
-            email=email,
-            mobile=mobile,
-            device_id=device_id,
-            description=description
-        )
-        session.add(new_issue)
-        await session.commit()
-        await session.refresh(new_issue)
+    try:
+        async with asyncio.timeout(tool_timeout_seconds()):
+            async with VoiceSessionLocal() as session:
+                new_issue = Issue(
+                    cust_id=cust_id,
+                    email=email,
+                    mobile=mobile,
+                    device_id=device_id,
+                    description=description
+                )
+                session.add(new_issue)
+                await session.commit()
+                await session.refresh(new_issue)
+    except TimeoutError:
+        await params.result_callback({
+            "status": "timeout",
+            "message": "Issue creation timed out and was not confirmed. Ask the user to retry later.",
+        })
+        return
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        await params.result_callback({
+            "status": "error",
+            "message": "Issue creation failed and was not confirmed. Ask the user to retry later.",
+        })
+        return
     
     await params.result_callback({
         "status": "success",

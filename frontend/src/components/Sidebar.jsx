@@ -34,8 +34,7 @@ export default function Sidebar({
   fileError,
   deleteRagFile,
   inspectRagFile,
-  latencyStats,
-  clearLatencyStats
+  liveLatency
 }) {
 
   const formatLatency = (value) => {
@@ -43,12 +42,7 @@ export default function Sidebar({
     return value < 1000 ? `${Math.round(value)} ms` : `${(value / 1000).toFixed(2)} s`;
   };
 
-  const average = (items) => items.length
-    ? items.reduce((sum, item) => sum + item.answer_audio_ms, 0) / items.length
-    : null;
-  const directTurns = latencyStats.filter((item) => !item.with_tools);
-  const toolTurns = latencyStats.filter((item) => item.with_tools);
-  const latestLatency = latencyStats.at(-1);
+  const primaryLatency = (item) => item.user_stop_to_playback_ms ?? item.answer_audio_ms;
 
   const formatFileSize = (sizeBytes) => {
     if (!sizeBytes) return '0 KB';
@@ -261,17 +255,18 @@ export default function Sidebar({
         <div className="latency-panel">
           <div className="latency-title">
             <span><Activity size={14} /> Live latency</span>
-            <button onClick={clearLatencyStats} disabled={!latencyStats.length}>Reset</button>
           </div>
           <div className="latency-latest">
-            <span>Latest {latestLatency ? `· ${latestLatency.category}` : ''}</span>
-            <strong>{formatLatency(latestLatency?.answer_audio_ms)}</strong>
+            <span>{liveLatency ? (liveLatency.with_tools ? 'With tool' : 'Without tool') : 'Waiting for a turn'}</span>
+            <strong>{formatLatency(liveLatency ? primaryLatency(liveLatency) : null)}</strong>
           </div>
-          <div className="latency-grid">
-            <div><span>Session avg · no tools</span><strong>{formatLatency(average(directTurns))}</strong><small>{directTurns.length} turns</small></div>
-            <div><span>Session avg · tools</span><strong>{formatLatency(average(toolTurns))}</strong><small>{toolTurns.length} turns</small></div>
+          <div className="latency-footnote">
+            {liveLatency?.user_stop_to_playback_ms != null
+              ? liveLatency.speech_end_signal === 'last_nonzero_local_audio_level'
+                ? `Last local speech → decoded audio${liveLatency.endpointing_ms != null ? ` · endpoint ${formatLatency(liveLatency.endpointing_ms)}` : ''}`
+                : 'Turn-stop signal → first decoded playback audio'
+              : 'Final transcript → first generated answer audio'}
           </div>
-          <div className="latency-footnote">Final transcript → first answer audio</div>
         </div>
       ) : null}
     </div>

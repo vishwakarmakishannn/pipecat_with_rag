@@ -1,7 +1,9 @@
 import pytest
 import asyncio
 
-from core.processors import ContextRetrievalProcessor, RollingVoiceQueryBuffer, TurnLatencyState
+from core.processors import ContextRetrievalProcessor, RollingVoiceQueryBuffer, ToolRoutingProcessor, TurnLatencyState
+from pipecat.frames.frames import OutputTransportMessageFrame, TranscriptionFrame, TTSAudioRawFrame, TTSSpeakFrame
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.processors.aggregators.llm_context import LLMContext
 from services.rag import (
     RetrievedRagChunk,
@@ -12,6 +14,8 @@ from services.rag import (
     should_attempt_rag_retrieval,
     validate_public_http_url,
     retrieve_rag_chunks,
+    bump_rag_corpus_version,
+    clear_rag_result_cache,
 )
 import services.rag as rag_service
 
@@ -55,6 +59,87 @@ def test_interrupted_response_does_not_remove_fresh_rag_context():
 
     processor.clear_dynamic_context()
     assert message not in context.messages
+
+
+def test_authoritative_user_turn_start_clears_rolling_query_and_dynamic_context():
+    context = LLMContext(messages=[])
+    processor = ContextRetrievalProcessor(1, 1, context)
+    message = {"role": "developer", "content": "old turn context"}
+    context.add_message(message)
+    processor._dynamic_messages.append(message)
+    processor._query_buffer.add("old interrupted question", now=1)
+
+    processor.start_user_turn()
+
+    assert processor._query_buffer.add("new question", now=2) == "new question"
+    assert message not in context.messages
+
+
+@pytest.mark.anyio
+async def test_new_retrieval_cancels_stale_fragment_without_delivering_it(monkeypatch):
+    first_started = asyncio.Event()
+    release_second = asyncio.Event()
+    delivered = []
+
+    async def fake_rag(_user_id, query, query_embedding=None):
+        assert query_embedding is None
+        if query == "first document question":
+            first_started.set()
+            await asyncio.Event().wait()
+        await release_second.wait()
+        return (f"context for {query}", None)
+
+    processor = ContextRetrievalProcessor(1, 1, LLMContext(messages=[]))
+
+    async def capture(frame, _direction):
+        delivered.append(frame)
+
+    monkeypatch.setattr("core.processors.build_rag_context_with_payload", fake_rag)
+    monkeypatch.setattr("core.processors.should_attempt_rag_retrieval", lambda _query: True)
+    monkeypatch.setattr(processor, "push_frame", capture)
+
+    first = TranscriptionFrame("first document question", "user", "1", finalized=True)
+    second = TranscriptionFrame("second document question", "user", "2", finalized=True)
+    await processor.process_frame(first, FrameDirection.DOWNSTREAM)
+    await asyncio.wait_for(first_started.wait(), timeout=0.2)
+    await processor.process_frame(second, FrameDirection.DOWNSTREAM)
+    release_second.set()
+    await asyncio.wait_for(processor._active_task, timeout=0.2)
+
+    transcriptions = [frame for frame in delivered if isinstance(frame, TranscriptionFrame)]
+    assert transcriptions == [second]
+
+
+@pytest.mark.anyio
+async def test_retrieval_deadline_includes_delivery_lock_wait(monkeypatch):
+    delivered = []
+    processor = ContextRetrievalProcessor(1, 1, LLMContext(messages=[]))
+    processor._retrieval_generation = 1
+
+    async def capture(frame, _direction):
+        delivered.append(frame)
+
+    monkeypatch.setattr("core.processors.RAG_VOICE_RETRIEVAL_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(processor, "push_frame", capture)
+    frame = TranscriptionFrame("document question", "user", "1", finalized=True)
+
+    await processor._delivery_lock.acquire()
+    started = asyncio.get_running_loop().time()
+    try:
+        await processor._retrieve_and_push(
+            frame,
+            frame.text,
+            FrameDirection.DOWNSTREAM,
+            False,
+            True,
+            False,
+            1,
+        )
+    finally:
+        processor._delivery_lock.release()
+
+    assert asyncio.get_running_loop().time() - started < 0.1
+    assert delivered == [frame]
 
 
 def test_smart_router_injects_without_document_words_when_vector_match_is_strong():
@@ -145,8 +230,63 @@ def test_latency_state_counts_transcript_fragments_as_one_active_turn():
     assert state.turn_id == 2
 
 
+def test_latency_turn_identity_starts_with_speech_not_final_transcript():
+    state = TurnLatencyState(session_id="test")
+
+    state.mark_user_started()
+    assert state.turn_id == 1
+    assert state.started_at is None
+    state.mark_user_stopped()
+    state.start_turn()
+    assert state.turn_id == 1
+    assert state.started_at == state.final_stt_at
+
+    state.finish_turn()
+    state.mark_user_started()
+    assert state.turn_id == 2
+    assert state.started_at is None
+
+
+def test_latency_state_reports_endpoint_relative_stage_telemetry():
+    state = TurnLatencyState(session_id="test")
+    state.mark_user_started()
+    state.mark_user_stopped()
+    state.start_turn()
+    state.mark_stage("retrieval_queued")
+
+    payload = state.telemetry_payload()
+
+    assert payload["basis"] == "user_stopped"
+    assert payload["speech_ms"] is not None
+    assert payload["stages_ms"]["user_stopped"] == 0.0
+    assert payload["stages_ms"]["final_stt"] >= 0.0
+    assert payload["stages_ms"]["retrieval_queued"] >= 0.0
+    assert payload["server_emitted_unix_ms"] > 0
+
+
+@pytest.mark.anyio
+async def test_first_audio_is_pushed_before_latency_diagnostics(monkeypatch):
+    state = TurnLatencyState(session_id="test")
+    state.start_turn()
+    state.first_llm_seen = True
+    from core.processors import LatencyBoundaryProcessor
+    boundary = LatencyBoundaryProcessor(state, "tts")
+    delivered = []
+
+    async def capture(frame, _direction):
+        delivered.append(frame)
+
+    monkeypatch.setattr(boundary, "push_frame", capture)
+    audio = TTSAudioRawFrame(b"\x00\x00", 24000, 1)
+    await boundary.process_frame(audio, FrameDirection.DOWNSTREAM)
+
+    assert delivered[0] is audio
+    assert isinstance(delivered[1], OutputTransportMessageFrame)
+
+
 @pytest.mark.anyio
 async def test_hybrid_retrieval_runs_vector_and_text_queries_concurrently(monkeypatch):
+    clear_rag_result_cache()
     vector_started = asyncio.Event()
     text_started = asyncio.Event()
 
@@ -168,6 +308,147 @@ async def test_hybrid_retrieval_runs_vector_and_text_queries_concurrently(monkey
     monkeypatch.setattr(rag_service, "_retrieve_text_candidates", fake_text)
 
     assert await retrieve_rag_chunks(1, "What does my document say?") == []
+
+
+@pytest.mark.anyio
+async def test_text_retrieval_starts_before_embedding_finishes(monkeypatch):
+    clear_rag_result_cache()
+    text_started = asyncio.Event()
+
+    async def fake_embed(_query):
+        await asyncio.wait_for(text_started.wait(), timeout=0.2)
+        return [0.1]
+
+    async def fake_vector(_user_id, _embedding):
+        return []
+
+    async def fake_text(_user_id, _query):
+        text_started.set()
+        return []
+
+    monkeypatch.setattr(rag_service, "embed_text", fake_embed)
+    monkeypatch.setattr(rag_service, "_retrieve_vector_candidates", fake_vector)
+    monkeypatch.setattr(rag_service, "_retrieve_text_candidates", fake_text)
+
+    assert await retrieve_rag_chunks(1, "What does my document say?") == []
+
+
+@pytest.mark.anyio
+async def test_rag_result_cache_uses_corpus_version(monkeypatch):
+    calls = 0
+
+    async def fake_retrieve(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return []
+
+    clear_rag_result_cache()
+    monkeypatch.setattr(rag_service, "_retrieve_rag_chunks_uncached", fake_retrieve)
+
+    await retrieve_rag_chunks(9, "  My   Document ")
+    await retrieve_rag_chunks(9, "my document")
+    assert calls == 1
+
+    bump_rag_corpus_version(9)
+    await retrieve_rag_chunks(9, "my document")
+    assert calls == 2
+
+
+@pytest.mark.anyio
+async def test_combined_memory_and_rag_share_one_embedding(monkeypatch):
+    embedding_calls = 0
+    seen_embeddings = []
+    processor = ContextRetrievalProcessor(1, 1, LLMContext(messages=[]))
+    processor._retrieval_generation = 1
+
+    async def fake_embed(_query):
+        nonlocal embedding_calls
+        embedding_calls += 1
+        await asyncio.sleep(0)
+        return [0.5]
+
+    async def fake_memory(
+        _user_id,
+        _query,
+        query_embedding=None,
+        current_conversation_id=None,
+    ):
+        assert current_conversation_id == 1
+        seen_embeddings.append(await query_embedding)
+        return None
+
+    async def fake_rag(_user_id, _query, query_embedding=None):
+        seen_embeddings.append(await query_embedding)
+        return None, None
+
+    async def capture(_frame, _direction):
+        return None
+
+    monkeypatch.setattr("core.processors.embed_text", fake_embed)
+    monkeypatch.setattr("core.processors.build_turn_memory_context", fake_memory)
+    monkeypatch.setattr("core.processors.build_rag_context_with_payload", fake_rag)
+    monkeypatch.setattr(processor, "push_frame", capture)
+    frame = TranscriptionFrame("remember my document", "user", "1", finalized=True)
+
+    await processor._retrieve_and_push(
+        frame,
+        frame.text,
+        FrameDirection.DOWNSTREAM,
+        True,
+        True,
+        False,
+        1,
+    )
+
+    assert embedding_calls == 1
+    assert seen_embeddings == [[0.5], [0.5]]
+
+
+@pytest.mark.anyio
+async def test_deterministic_web_search_runs_before_llm_and_suppresses_tool_pass(monkeypatch):
+    context = LLMContext(messages=[])
+    state = TurnLatencyState(session_id="test")
+    state.start_turn()
+    delivered = []
+
+    async def fake_web_search(query):
+        await asyncio.sleep(0)
+        return {"query": query, "answer": "It is sunny."}
+
+    async def capture(frame, _direction):
+        delivered.append(frame)
+
+    processor = ContextRetrievalProcessor(
+        1,
+        1,
+        context,
+        state,
+        web_search=fake_web_search,
+    )
+    monkeypatch.setattr("core.processors.should_attempt_rag_retrieval", lambda _query: False)
+    monkeypatch.setattr(processor, "push_frame", capture)
+    frame = TranscriptionFrame("look up the latest weather", "user", "1", finalized=True)
+
+    await processor.process_frame(frame, FrameDirection.DOWNSTREAM)
+    task = processor._active_task
+    assert task is not None
+    await asyncio.wait_for(task, timeout=0.2)
+
+    assert isinstance(delivered[0], TTSSpeakFrame)
+    assert delivered[-1] is frame
+    assert processor.web_search_resolved is True
+    assert processor.tool_filler_emitted is True
+    assert state.tool_used is True
+    assert any("It is sunny" in message.get("content", "") for message in context.messages)
+
+    context.add_message({"role": "user", "content": frame.text})
+    router = ToolRoutingProcessor(
+        context,
+        search_tool=lambda: None,
+        issue_tool=lambda: None,
+        retrieval=processor,
+    )
+    assert router.route() == []
 
 
 @pytest.mark.anyio
@@ -212,7 +493,7 @@ def test_chunk_link_markdown_preserves_heading_context():
 
 @pytest.mark.anyio
 async def test_build_rag_context_formats_retrieved_chunks(monkeypatch):
-    async def fake_retrieve(user_id, query):
+    async def fake_retrieve(user_id, query, query_embedding=None):
         assert user_id == 7
         assert query == "What does my PDF say about AI?"
         return [
@@ -242,7 +523,7 @@ async def test_build_rag_context_formats_retrieved_chunks(monkeypatch):
 
 @pytest.mark.anyio
 async def test_build_rag_context_formats_link_chunks(monkeypatch):
-    async def fake_retrieve(user_id, query):
+    async def fake_retrieve(user_id, query, query_embedding=None):
         return [
             RetrievedRagChunk(
                 id=1,

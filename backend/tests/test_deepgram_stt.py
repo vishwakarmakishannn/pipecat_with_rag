@@ -16,6 +16,14 @@ class _FailingConnection:
         raise AssertionError("socket media failed")
 
 
+class _RecordingConnection:
+    def __init__(self):
+        self.media = []
+
+    async def send_media(self, audio):
+        self.media.append(audio)
+
+
 @pytest.mark.anyio
 async def test_keepalive_failure_schedules_one_reconnect(monkeypatch):
     service = object.__new__(ResilientDeepgramSTTService)
@@ -132,3 +140,71 @@ async def test_media_failure_schedules_only_one_follow_up_reconnect():
     release_reconnect.set()
     await first_task
     assert reconnects == 1
+
+
+@pytest.mark.anyio
+async def test_disconnected_media_is_buffered_and_replayed_in_order():
+    service = object.__new__(ResilientDeepgramSTTService)
+    service._name = "TestDeepgramSTT"
+    service._connection = None
+    service._connection_ready = asyncio.Event()
+    service._media_recovery_task = asyncio.create_task(asyncio.Event().wait())
+    service._reconnect_media_buffer = __import__("collections").deque()
+    service._reconnect_media_bytes = 0
+    service._reconnect_media_max_bytes = 1024
+
+    [item async for item in service.run_stt(b"first")]
+    [item async for item in service.run_stt(b"second")]
+    assert list(service._reconnect_media_buffer) == [b"first", b"second"]
+
+    connection = _RecordingConnection()
+    service._connection = connection
+    await service._flush_media_buffer()
+
+    assert connection.media == [b"first", b"second"]
+    assert not service._reconnect_media_buffer
+    service._media_recovery_task.cancel()
+    await asyncio.gather(service._media_recovery_task, return_exceptions=True)
+
+
+def test_reconnect_buffer_drops_oldest_audio_when_bounded():
+    service = object.__new__(ResilientDeepgramSTTService)
+    service._name = "TestDeepgramSTT"
+    service._reconnect_media_buffer = __import__("collections").deque()
+    service._reconnect_media_bytes = 0
+    service._reconnect_media_max_bytes = 6
+
+    service._buffer_media(b"1111")
+    service._buffer_media(b"2222")
+
+    assert list(service._reconnect_media_buffer) == [b"2222"]
+
+
+@pytest.mark.anyio
+async def test_connect_waits_until_socket_is_ready(monkeypatch):
+    service = object.__new__(ResilientDeepgramSTTService)
+    service._name = "TestDeepgramSTT"
+    service._connection = None
+    service._connection_task = None
+    service._connection_ready = asyncio.Event()
+
+    async def connection_handler():
+        await asyncio.sleep(0.01)
+        service._connection = object()
+        service._connection_ready.set()
+
+    service._connection_handler = connection_handler
+    service.create_task = lambda coro, name=None: asyncio.create_task(coro, name=name)
+    service.cancel_task = lambda task: asyncio.gather(task, return_exceptions=True)
+    monkeypatch.setenv("STT_CONNECT_TIMEOUT_SECONDS", "1")
+
+    await service._connect()
+
+    assert service._connection_ready.is_set()
+    await service.cancel_task(service._connection_task)
+
+
+def test_connect_timeout_is_validated(monkeypatch):
+    monkeypatch.setenv("STT_CONNECT_TIMEOUT_SECONDS", "60")
+    with pytest.raises(ValueError, match="STT_CONNECT_TIMEOUT_SECONDS"):
+        ResilientDeepgramSTTService._connect_timeout_seconds()

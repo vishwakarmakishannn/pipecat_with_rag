@@ -9,6 +9,13 @@ class BackgroundTaskQueue:
         self._is_running = False
         self._key_locks: dict[Any, asyncio.Lock] = {}
 
+    @property
+    def is_running(self) -> bool:
+        """Whether background persistence workers are accepting work."""
+        return self._is_running and bool(self._workers) and all(
+            not worker.done() for worker in self._workers
+        )
+
     async def _worker(self):
         while self._is_running:
             try:

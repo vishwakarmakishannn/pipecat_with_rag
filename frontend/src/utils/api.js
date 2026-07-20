@@ -1,4 +1,11 @@
-export const API_BASE = `${window.location.protocol}//${window.location.hostname}:7860`;
+const developmentApiBase = `${window.location.protocol}//${window.location.hostname}:7860`;
+
+// Production traffic stays on the page origin and is forwarded by Nginx. This
+// reuses the browser's existing TLS connection and avoids CORS preflights. The
+// explicit override remains useful for split-origin or hosted deployments.
+export const API_BASE = (
+  import.meta.env.VITE_API_BASE || (import.meta.env.DEV ? developmentApiBase : window.location.origin)
+).replace(/\/$/, '');
 
 export class ApiError extends Error {
   constructor(message, status = 0, data = null) {

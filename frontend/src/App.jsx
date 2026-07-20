@@ -13,6 +13,7 @@ import { SmallWebRTCTransport } from '@pipecat-ai/small-webrtc-transport';
 import { Mic, Volume2, X } from 'lucide-react';
 import { jwtDecode } from 'jwt-decode';
 import { fetchWithAuth, API_BASE } from './utils/api';
+import { buildAudioConstraints, buildIceServers, localSpeechLevelThreshold } from './utils/webrtc';
 import './App.css';
 
 const START_ENDPOINT =
@@ -26,7 +27,10 @@ const ChunkInspector = lazy(() => import('./components/ChunkInspector'));
 
 function createPipecatClient() {
   return new PipecatClient({
-    transport: new SmallWebRTCTransport(),
+    transport: new SmallWebRTCTransport({
+      iceServers: buildIceServers(),
+      waitForICEGathering: false,
+    }),
     enableMic: true,
     enableCam: false,
   });
@@ -74,12 +78,25 @@ function VoiceApp({ onResetClient }) {
   const shouldAutoScrollRef = React.useRef(true);
   
   const botTextRef = React.useRef('');
+  const pendingBotTextRef = React.useRef('');
+  const botTextFlushTimerRef = React.useRef(null);
   const activeBotMessageIdRef = React.useRef(null);
   const toolCallPayloadsRef = React.useRef({});
-  const savedToolCallIdsRef = React.useRef(new Set());
+  const voiceTurnTimingRef = React.useRef({
+    speechStartedAt: null,
+    speechStoppedAt: null,
+    turnStopSignalAt: null,
+    lastLocalSpeechAt: null,
+    localSpeechObserved: false,
+    botTtsStartedAt: null,
+    firstRemoteAudioAt: null,
+    awaitingRemoteAudio: false,
+  });
+  const pendingLatencyRef = React.useRef(null);
   
   const [expandedToolCalls, setExpandedToolCalls] = useState({});
-  const [latencyStats, setLatencyStats] = useState([]);
+  const [liveLatency, setLiveLatency] = useState(null);
+  const [isVoiceBusy, setIsVoiceBusy] = useState(false);
 
   const toggleToolCall = (id) => {
     setExpandedToolCalls(prev => ({...prev, [id]: !prev[id]}));
@@ -141,10 +158,11 @@ function VoiceApp({ onResetClient }) {
 
   React.useEffect(() => {
     if (sidebarTab !== 'files') return undefined;
+    if (isVoiceBusy) return undefined;
     if (!ragFiles.some((file) => file.status === 'processing')) return undefined;
     const intervalId = window.setInterval(fetchFiles, 2500);
     return () => window.clearInterval(intervalId);
-  }, [fetchFiles, ragFiles, sidebarTab]);
+  }, [fetchFiles, isVoiceBusy, ragFiles, sidebarTab]);
 
   React.useEffect(() => {
     currentConversationIdRef.current = currentConversationId;
@@ -152,7 +170,7 @@ function VoiceApp({ onResetClient }) {
 
   React.useEffect(() => {
     if (!shouldAutoScrollRef.current) return;
-    transcriptBottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    transcriptBottomRef.current?.scrollIntoView({ behavior: 'auto', block: 'end' });
   }, [transcripts]);
 
   const handleTranscriptScroll = useCallback(() => {
@@ -302,29 +320,8 @@ function VoiceApp({ onResetClient }) {
     currentConversationIdRef.current = null;
     setCurrentConversationId(null);
     setTranscripts([]);
-    setLatencyStats([]);
+    setLiveLatency(null);
   };
-
-  const saveToolCallTranscript = useCallback(async (payload) => {
-    const convId = currentConversationIdRef.current;
-    if (!convId) return;
-
-    try {
-      const res = await fetchWithAuth(`/api/conversations/${convId}/messages`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          role: 'ToolCall',
-          content: JSON.stringify(payload)
-        })
-      });
-      if (res.ok) fetchConversations();
-    } catch (err) {
-      console.warn('Failed to save tool call transcript', err);
-    }
-  }, [fetchConversations]);
 
   const addTranscript = useCallback((role, text, isDelta = false, messageId = null) => {
     if (!text) return;
@@ -352,12 +349,84 @@ function VoiceApp({ onResetClient }) {
     });
   }, []);
 
+  const flushBotText = useCallback(() => {
+    if (botTextFlushTimerRef.current) {
+      window.clearTimeout(botTextFlushTimerRef.current);
+      botTextFlushTimerRef.current = null;
+    }
+    const text = pendingBotTextRef.current;
+    pendingBotTextRef.current = '';
+    if (!text) return;
+    if (!activeBotMessageIdRef.current) {
+      activeBotMessageIdRef.current = `bot-${Date.now()}`;
+    }
+    addTranscript('Aura', text, true, activeBotMessageIdRef.current);
+  }, [addTranscript]);
+
+  const scheduleBotTextFlush = useCallback(() => {
+    if (botTextFlushTimerRef.current) return;
+    botTextFlushTimerRef.current = window.setTimeout(flushBotText, 40);
+  }, [flushBotText]);
+
+  React.useEffect(() => () => {
+    if (botTextFlushTimerRef.current) {
+      window.clearTimeout(botTextFlushTimerRef.current);
+    }
+  }, []);
+
+  const commitClientLatency = useCallback(() => {
+    const pending = pendingLatencyRef.current;
+    const timing = voiceTurnTimingRef.current;
+    if (!pending || timing.firstRemoteAudioAt == null) return;
+
+    const clientMetrics = {
+      client_message_to_audio_ms: Math.round(
+        (timing.firstRemoteAudioAt - pending.receivedPerfAt) * 10,
+      ) / 10,
+      user_stop_to_playback_ms: timing.speechStoppedAt == null
+        ? null
+        : Math.round((timing.firstRemoteAudioAt - timing.speechStoppedAt) * 10) / 10,
+      turn_stop_signal_to_playback_ms: timing.turnStopSignalAt == null
+        ? null
+        : Math.round((timing.firstRemoteAudioAt - timing.turnStopSignalAt) * 10) / 10,
+      endpointing_ms: timing.turnStopSignalAt == null || !timing.localSpeechObserved
+        ? null
+        : Math.max(0, Math.round((timing.turnStopSignalAt - timing.speechStoppedAt) * 10) / 10),
+      client_speech_ms: timing.speechStartedAt == null || timing.speechStoppedAt == null
+        ? null
+        : Math.round((timing.speechStoppedAt - timing.speechStartedAt) * 10) / 10,
+      tts_signal_to_playback_ms: timing.botTtsStartedAt == null
+        ? null
+        : Math.round((timing.firstRemoteAudioAt - timing.botTtsStartedAt) * 10) / 10,
+      playback_detected_unix_ms: Date.now(),
+      playback_signal: 'first_nonzero_remote_audio_level',
+      speech_end_signal: timing.localSpeechObserved
+        ? 'last_nonzero_local_audio_level'
+        : 'server_turn_stop_event',
+    };
+
+    setLiveLatency((current) => (
+      current?.turn_id === pending.turnId ? { ...current, ...clientMetrics } : current
+    ));
+    pendingLatencyRef.current = null;
+  }, []);
+
   useRTVIClientEvent(
     RTVIEvent.TransportStateChanged,
     useCallback((state) => {
       if (state === 'ready' || state === 'connected' || state === 'error') {
         setIsConnecting(false);
       }
+    }, []),
+  );
+
+  useRTVIClientEvent(
+    RTVIEvent.TrackStarted,
+    useCallback((track, participant) => {
+      if (track?.kind !== 'audio' || !participant?.local || !track.applyConstraints) return;
+      track.applyConstraints(buildAudioConstraints()).catch((constraintError) => {
+        console.warn('Could not apply microphone DSP constraints', constraintError);
+      });
     }, []),
   );
 
@@ -369,9 +438,87 @@ function VoiceApp({ onResetClient }) {
   );
 
   useRTVIClientEvent(
+    RTVIEvent.UserStartedSpeaking,
+    useCallback(() => {
+      setIsVoiceBusy(true);
+      const timing = voiceTurnTimingRef.current;
+      if (timing.speechStartedAt == null || timing.firstRemoteAudioAt != null) {
+        voiceTurnTimingRef.current = {
+          speechStartedAt: performance.now(),
+          speechStoppedAt: null,
+          turnStopSignalAt: null,
+          lastLocalSpeechAt: null,
+          localSpeechObserved: false,
+          botTtsStartedAt: null,
+          firstRemoteAudioAt: null,
+          awaitingRemoteAudio: false,
+        };
+        pendingLatencyRef.current = null;
+      }
+    }, []),
+  );
+
+  useRTVIClientEvent(
+    RTVIEvent.LocalAudioLevel,
+    useCallback((level) => {
+      const timing = voiceTurnTimingRef.current;
+      if (timing.speechStartedAt == null || timing.turnStopSignalAt != null) return;
+      if (Number(level) <= localSpeechLevelThreshold()) return;
+      timing.lastLocalSpeechAt = performance.now();
+      timing.localSpeechObserved = true;
+    }, []),
+  );
+
+  useRTVIClientEvent(
+    RTVIEvent.UserStoppedSpeaking,
+    useCallback(() => {
+      const timing = voiceTurnTimingRef.current;
+      const receivedAt = performance.now();
+      timing.turnStopSignalAt = receivedAt;
+      timing.speechStoppedAt = timing.localSpeechObserved
+        ? timing.lastLocalSpeechAt
+        : receivedAt;
+    }, []),
+  );
+
+  useRTVIClientEvent(
+    RTVIEvent.BotTtsStarted,
+    useCallback(() => {
+      setIsVoiceBusy(true);
+      const timing = voiceTurnTimingRef.current;
+      timing.botTtsStartedAt = performance.now();
+      timing.awaitingRemoteAudio = true;
+    }, []),
+  );
+
+  useRTVIClientEvent(
+    RTVIEvent.BotTtsStopped,
+    useCallback(() => {
+      setIsVoiceBusy(false);
+      fetchConversations();
+    }, [fetchConversations]),
+  );
+
+  useRTVIClientEvent(
+    RTVIEvent.RemoteAudioLevel,
+    useCallback((level) => {
+      const timing = voiceTurnTimingRef.current;
+      if (!timing.awaitingRemoteAudio || Number(level) <= 0.0001) return;
+      timing.awaitingRemoteAudio = false;
+      timing.firstRemoteAudioAt = performance.now();
+      commitClientLatency();
+    }, [commitClientLatency]),
+  );
+
+  useRTVIClientEvent(
     RTVIEvent.BotLlmStarted,
     useCallback(() => {
+      if (botTextFlushTimerRef.current) {
+        window.clearTimeout(botTextFlushTimerRef.current);
+        botTextFlushTimerRef.current = null;
+      }
       botTextRef.current = '';
+      pendingBotTextRef.current = '';
       activeBotMessageIdRef.current = `bot-${Date.now()}`;
     }, []),
   );
@@ -444,30 +591,24 @@ function VoiceApp({ onResetClient }) {
           }
         ];
       });
-      if (!savedToolCallIdsRef.current.has(toolCallId)) {
-        savedToolCallIdsRef.current.add(toolCallId);
-        saveToolCallTranscript(payloadToSave);
-      }
-    }, [saveToolCallTranscript]),
+    }, []),
   );
 
   useRTVIClientEvent(
     RTVIEvent.BotLlmText,
     useCallback((data) => {
       botTextRef.current += data.text;
-      if (!activeBotMessageIdRef.current) {
-        activeBotMessageIdRef.current = `bot-${Date.now()}`;
-      }
-      addTranscript('Aura', data.text, true, activeBotMessageIdRef.current);
-    }, [addTranscript]),
+      pendingBotTextRef.current += data.text;
+      scheduleBotTextFlush();
+    }, [scheduleBotTextFlush]),
   );
 
   useRTVIClientEvent(
     RTVIEvent.BotLlmStopped,
     useCallback(() => {
+      flushBotText();
       activeBotMessageIdRef.current = null;
-      fetchConversations();
-    }, [fetchConversations]),
+    }, [flushBotText]),
   );
 
   useRTVIClientEvent(
@@ -482,8 +623,24 @@ function VoiceApp({ onResetClient }) {
     RTVIEvent.ServerMessage,
     useCallback((data) => {
       const messageData = data?.data || data;
+      if (messageData?.type === 'conversation_ready' && messageData.payload?.conversation_id) {
+        const conversationId = messageData.payload.conversation_id;
+        currentConversationIdRef.current = conversationId;
+        setCurrentConversationId(conversationId);
+        fetchConversations();
+        return;
+      }
       if (messageData?.type === 'latency_stats' && messageData.payload) {
-        setLatencyStats((items) => [...items.slice(-19), { ...messageData.payload, receivedAt: Date.now() }]);
+        const receivedPerfAt = performance.now();
+        pendingLatencyRef.current = {
+          turnId: messageData.payload.turn_id,
+          receivedPerfAt,
+        };
+        setLiveLatency({
+          ...messageData.payload,
+          client_received_unix_ms: Date.now(),
+        });
+        commitClientLatency();
         return;
       }
       if (messageData?.type !== 'rag_call' || !messageData.payload) return;
@@ -502,7 +659,7 @@ function VoiceApp({ onResetClient }) {
           }
         ];
       });
-    }, []),
+    }, [commitClientLatency, fetchConversations]),
   );
 
   const startConversation = async () => {
@@ -510,35 +667,16 @@ function VoiceApp({ onResetClient }) {
 
     setError('');
     setIsConnecting(true);
-    setLatencyStats([]);
+    setLiveLatency(null);
 
     try {
-      let convId = currentConversationId;
-      if (!convId) {
-        const res = await fetchWithAuth(`/api/conversations`, {
-          method: 'POST',
-          headers: { 
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({ title: 'New conversation' })
-        });
-        if (res.ok) {
-          const data = await res.json();
-          convId = data.id;
-          currentConversationIdRef.current = convId;
-          setCurrentConversationId(convId);
-          fetchConversations();
-        }
-      }
-
       await pcClient.startBotAndConnect({
         endpoint: START_ENDPOINT,
         requestData: {
           transport: 'webrtc',
-          enableDefaultIceServers: true,
           body: {
             token: localStorage.getItem('aura_token'),
-            conversation_id: convId,
+            conversation_id: currentConversationId,
           },
         },
       });
@@ -551,6 +689,7 @@ function VoiceApp({ onResetClient }) {
   const disconnect = async () => {
     setError('');
     setIsConnecting(false);
+    setIsVoiceBusy(false);
     try {
       await pcClient?.disconnect();
     } finally {
@@ -589,8 +728,7 @@ function VoiceApp({ onResetClient }) {
         fileError={fileError}
         deleteRagFile={deleteRagFile}
         inspectRagFile={setInspectedFile}
-        latencyStats={latencyStats}
-        clearLatencyStats={() => setLatencyStats([])}
+        liveLatency={liveLatency}
       />
 
       <div className="main-stage">

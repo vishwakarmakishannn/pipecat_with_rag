@@ -1,6 +1,9 @@
-FROM python:3.11-slim
+FROM python:3.12-slim AS builder
 
 WORKDIR /app
+
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy
 
 # Install system dependencies required for building some python packages
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -8,19 +11,37 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install uv
-RUN pip install uv
+# Install uv only in the build stage.
+RUN pip install --no-cache-dir uv
 
 # Copy dependency files
 COPY pyproject.toml uv.lock ./
 
 # Install dependencies using uv
-RUN uv sync --frozen --no-install-project
+RUN uv sync --frozen --no-dev --no-install-project
 
 COPY . .
 
 # Install the actual project using uv
-RUN uv sync --frozen
+RUN uv sync --frozen --no-dev
 
-# Run the app using uv
-CMD ["/bin/sh", "-c", "uv run alembic upgrade head && exec uv run main.py"]
+FROM python:3.12-slim AS runtime
+
+WORKDIR /app
+
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# ONNX Runtime requires the OpenMP runtime, but compilers and headers stay out
+# of the final image to reduce image pull and scale-out time.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app /app
+
+# Schema migration is an explicit deployment job (the Compose `migrate`
+# service), so application replicas can start concurrently without contending
+# on Alembic locks.
+CMD ["python", "main.py"]

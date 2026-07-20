@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
 from api.auth import ALGORITHM, SECRET_KEY
-from core.database import AsyncSessionLocal
+from core.database import AsyncSessionLocal, VoiceSessionLocal
 from core.memory_config import (
     MEMORY_EMBEDDING_DIMENSION,
     MEMORY_EMBEDDING_CACHE_SIZE,
@@ -25,6 +25,7 @@ from core.memory_config import (
     MEMORY_SUMMARY_MAX_CHARS,
     MEMORY_RECENT_MAX_CHARS,
     MEMORY_PRIOR_MAX_CHARS,
+    MEMORY_PROMPT_MAX_TOKENS,
     MEMORY_EMBEDDING_PROVIDER,
     MEMORY_FACT_CONFIDENCE_MIN,
     MEMORY_LLM_TIMEOUT_SECONDS,
@@ -61,6 +62,7 @@ INVALID_NAME_VALUES = {
 _memory_llm_backoff_until = 0.0
 _google_client = None
 _openai_client = None
+_groq_client = None
 _embedding_cache: OrderedDict[tuple[str, str, str, int], tuple[float, list[float]]] = OrderedDict()
 _embedding_inflight: dict[tuple[str, str, str, int], asyncio.Task] = {}
 _embedding_lock = asyncio.Lock()
@@ -80,6 +82,17 @@ def _get_openai_client():
         from openai import AsyncOpenAI
         _openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     return _openai_client
+
+
+def _get_groq_client():
+    global _groq_client
+    if _groq_client is None:
+        from openai import AsyncOpenAI
+        _groq_client = AsyncOpenAI(
+            api_key=os.getenv("GROQ_API_KEY"),
+            base_url="https://api.groq.com/openai/v1",
+        )
+    return _groq_client
 
 
 def is_memory_fact_candidate(text_value: str) -> bool:
@@ -138,6 +151,34 @@ async def authenticate_token(token: str | None, db: AsyncSession) -> User | None
     return result.scalars().first()
 
 
+async def authenticate_conversation(
+    token: str | None,
+    conversation_id: int,
+    db: AsyncSession,
+) -> tuple[User, Conversation] | None:
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = payload.get("sub")
+    except Exception as exc:
+        logger.warning(f"Memory auth failed: {exc}")
+        return None
+    if not username:
+        return None
+
+    result = await db.execute(
+        select(User, Conversation)
+        .join(Conversation, Conversation.user_id == User.id)
+        .where(
+            User.username == username,
+            Conversation.id == conversation_id,
+        )
+    )
+    row = result.first()
+    return (row[0], row[1]) if row else None
+
+
 async def _load_recent_messages(
     db: AsyncSession,
     conversation_id: int,
@@ -170,7 +211,7 @@ async def _load_most_recent_prior_conversation(
 
 
 async def _load_active_facts(user_id: int) -> list[UserMemory]:
-    async with AsyncSessionLocal() as db:
+    async with VoiceSessionLocal() as db:
         result = await db.execute(
             select(UserMemory)
             .where(UserMemory.user_id == user_id, UserMemory.status == "active")
@@ -180,7 +221,7 @@ async def _load_active_facts(user_id: int) -> list[UserMemory]:
 
 
 async def _load_recent_messages_in_session(conversation_id: int, limit: int) -> list[Message]:
-    async with AsyncSessionLocal() as db:
+    async with VoiceSessionLocal() as db:
         return await _load_recent_messages(db, conversation_id, limit)
 
 
@@ -188,31 +229,33 @@ async def load_memory_bundle(body: Any, recent_limit: int = RECENT_MESSAGE_LIMIT
     request_body = normalize_runner_body(body)
     token = request_body.get("token")
     conversation_id = request_body.get("conversation_id")
-    if not token or not conversation_id:
+    if not token:
         return None
 
-    try:
-        conversation_id = int(conversation_id)
-    except (TypeError, ValueError):
-        logger.warning("Memory hydration skipped: invalid conversation_id")
-        return None
-
-    async with AsyncSessionLocal() as db:
-        user = await authenticate_token(token, db)
-        if not user:
-            logger.warning("Memory hydration skipped: invalid token")
+    if conversation_id is not None:
+        try:
+            conversation_id = int(conversation_id)
+        except (TypeError, ValueError):
+            logger.warning("Memory hydration skipped: invalid conversation_id")
             return None
 
-        conv_result = await db.execute(
-            select(Conversation).where(
-                Conversation.id == conversation_id,
-                Conversation.user_id == user.id,
-            )
-        )
-        conversation = conv_result.scalars().first()
-        if not conversation:
-            logger.warning("Memory hydration skipped: conversation does not belong to user")
-            return None
+    async with VoiceSessionLocal() as db:
+        if conversation_id is None:
+            user = await authenticate_token(token, db)
+            if not user:
+                logger.warning("Memory hydration skipped: invalid token")
+                return None
+            conversation = Conversation(user_id=user.id, title="New conversation")
+            db.add(conversation)
+            await db.commit()
+            await db.refresh(conversation)
+            conversation_id = conversation.id
+        else:
+            authenticated = await authenticate_conversation(token, conversation_id, db)
+            if not authenticated:
+                logger.warning("Memory hydration skipped: invalid token or conversation ownership")
+                return None
+            user, conversation = authenticated
 
         user_id = user.id
 
@@ -221,29 +264,14 @@ async def load_memory_bundle(body: Any, recent_limit: int = RECENT_MESSAGE_LIMIT
         _load_recent_messages_in_session(conversation_id, recent_limit),
     )
 
-    prior_conversation = None
-    prior_recent_messages = None
-    if not recent_messages:
-        async with AsyncSessionLocal() as db:
-            prior_conversation = await _load_most_recent_prior_conversation(
-                db,
-                user_id,
-                conversation_id,
-            )
-        if prior_conversation:
-            prior_recent_messages = await _load_recent_messages_in_session(
-                prior_conversation.id,
-                PRIOR_CONVERSATION_MESSAGE_LIMIT,
-            )
-
     return MemoryBundle(
         user=user,
         primary_conversation=conversation,
         facts=facts,
         primary_summary=conversation.summary or "",
         primary_recent_messages=recent_messages,
-        prior_conversation=prior_conversation,
-        prior_recent_messages=prior_recent_messages,
+        prior_conversation=None,
+        prior_recent_messages=None,
     )
 
 
@@ -311,6 +339,49 @@ def _recent_llm_messages(messages: list[Message]) -> list[dict[str, str]]:
     return list(reversed(selected))
 
 
+def _budget_memory_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Deduplicate and fit memory under one approximate token budget."""
+    max_chars = max(4, MEMORY_PROMPT_MAX_TOKENS * 4)
+    developers = [message for message in messages if message.get("role") == "developer"]
+    conversation = [message for message in messages if message.get("role") != "developer"]
+    selected_developers: list[dict[str, str]] = []
+    seen: set[str] = set()
+    used = 0
+
+    for message in developers:
+        content = message.get("content", "")
+        normalized = re.sub(r"\s+", " ", content).strip().lower()
+        if not normalized or normalized in seen or used >= max_chars:
+            continue
+        remaining = max_chars - used
+        selected = {**message, "content": content[:remaining]}
+        selected_developers.append(selected)
+        used += len(selected["content"])
+        seen.add(normalized)
+
+    developer_text = " ".join(
+        re.sub(r"\s+", " ", message["content"]).lower()
+        for message in selected_developers
+    )
+    selected_conversation: list[dict[str, str]] = []
+    for message in reversed(conversation):
+        content = message.get("content", "")
+        normalized = re.sub(r"\s+", " ", content).strip().lower()
+        if not normalized or normalized in seen:
+            continue
+        if len(normalized) >= 24 and normalized in developer_text:
+            continue
+        remaining = max_chars - used
+        if remaining <= 0:
+            break
+        selected = {**message, "content": content[:remaining]}
+        selected_conversation.append(selected)
+        used += len(selected["content"])
+        seen.add(normalized)
+
+    return selected_developers + list(reversed(selected_conversation))
+
+
 def build_memory_messages(bundle: MemoryBundle | None) -> list[dict[str, str]]:
     if not bundle:
         return []
@@ -366,7 +437,7 @@ def build_memory_messages(bundle: MemoryBundle | None) -> list[dict[str, str]]:
                 ),
             }
         )
-    return messages
+    return _budget_memory_messages(messages)
 
 
 def _extract_json_object(text_value: str) -> dict[str, Any]:
@@ -416,18 +487,33 @@ async def _generate_text_with_memory_llm(prompt: str) -> str | None:
         )
         return response.choices[0].message.content
 
-    generators = [generate_google, generate_openai]
-    if provider != "google":
-        generators.reverse()
+    async def generate_groq() -> str | None:
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            return None
+        client = _get_groq_client()
+        response = await client.chat.completions.create(
+            model=os.getenv("GROQ_MEMORY_MODEL", os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")),
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.choices[0].message.content
 
-    for generator in generators:
-        try:
-            return await asyncio.wait_for(generator(), timeout=MEMORY_LLM_TIMEOUT_SECONDS)
-        except Exception as exc:
-            logger.warning(f"Memory LLM call failed: {exc}")
-            if "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc):
-                _memory_llm_backoff_until = asyncio.get_running_loop().time() + 60.0
-    return None
+    generator = {
+        "google": generate_google,
+        "groq": generate_groq,
+        "openai": generate_openai,
+    }.get(provider)
+    if generator is None:
+        logger.error("Unsupported memory LLM provider: {}", provider)
+        return None
+
+    try:
+        return await asyncio.wait_for(generator(), timeout=MEMORY_LLM_TIMEOUT_SECONDS)
+    except Exception as exc:
+        logger.warning("Memory {} LLM call failed: {}", provider, exc)
+        if "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc):
+            _memory_llm_backoff_until = asyncio.get_running_loop().time() + 60.0
+        return None
 
 
 async def _embed_uncached(value: str, provider: str) -> list[float] | None:
@@ -785,16 +871,22 @@ async def retrieve_semantic_memories(
     user_id: int,
     query: str,
     top_k: int = MEMORY_RECALL_TOP_K,
+    query_embedding=None,
 ) -> list[tuple[MemoryChunk, float]]:
     if not _is_recall_query(query):
         return []
 
-    embedding = await embed_text(query)
+    if isinstance(query_embedding, asyncio.Future) or asyncio.iscoroutine(query_embedding):
+        embedding = await query_embedding
+    elif query_embedding is not None:
+        embedding = query_embedding
+    else:
+        embedding = await embed_text(query)
     if not embedding:
         return []
 
     try:
-        async with AsyncSessionLocal() as db:
+        async with VoiceSessionLocal() as db:
             distance = MemoryChunk.embedding.cosine_distance(embedding).label("distance")
             result = await db.execute(
                 select(MemoryChunk, distance)
@@ -813,10 +905,45 @@ async def retrieve_semantic_memories(
         return []
 
 
-async def build_turn_memory_context(user_id: int, query: str) -> str | None:
-    memories = await retrieve_semantic_memories(user_id, query, MEMORY_RECALL_TOP_K)
+async def build_turn_memory_context(
+    user_id: int,
+    query: str,
+    query_embedding=None,
+    current_conversation_id: int | None = None,
+) -> str | None:
+    memories = await retrieve_semantic_memories(
+        user_id,
+        query,
+        MEMORY_RECALL_TOP_K,
+        query_embedding=query_embedding,
+    )
     if not memories:
-        return None
+        if not _is_recall_query(query):
+            return None
+        async with VoiceSessionLocal() as db:
+            prior_conversation = await _load_most_recent_prior_conversation(
+                db,
+                user_id,
+                current_conversation_id or -1,
+            )
+            if not prior_conversation:
+                return None
+            prior_messages = await _load_recent_messages(
+                db,
+                prior_conversation.id,
+                PRIOR_CONVERSATION_MESSAGE_LIMIT,
+            )
+        if not prior_messages:
+            return None
+        lines = [
+            "Relevant recent prior conversation retrieved on explicit recall. "
+            "Use it only to answer the current recall question."
+        ]
+        lines.extend(
+            f"- {'User' if message.role == 'You' else 'Aura'}: {message.content}"
+            for message in prior_messages
+        )
+        return "\n".join(lines)[:MEMORY_PRIOR_MAX_CHARS]
 
     lines = [
         "Relevant long-term episodic memories retrieved for this user. Use them only if relevant to the user's current question."
