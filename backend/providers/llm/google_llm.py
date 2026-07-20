@@ -8,5 +8,9 @@ def get_google_llm():
         settings=GoogleLLMService.Settings(
             model=os.getenv("GOOGLE_MODEL", "gemini-3.1-flash-lite"),
             system_instruction=load_system_prompt(),
+            thinking=GoogleLLMService.ThinkingConfig(
+                thinking_level=os.getenv("GOOGLE_THINKING_LEVEL", "minimal"),
+                include_thoughts=False
+            ),
         ),
     )
