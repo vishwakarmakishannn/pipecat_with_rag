@@ -51,6 +51,8 @@ class RagLinkCreate(BaseModel):
 
 
 class RagSearchResult(BaseModel):
+    chunk_id: int
+    chunk_index: int | None
     file_id: int
     filename: str
     page_start: int | None
@@ -58,6 +60,9 @@ class RagSearchResult(BaseModel):
     heading_path: str | None
     content: str
     score: float
+    vector_similarity: float | None
+    text_rank: float | None
+    source_types: list[str]
 
 
 class RagChunkResponse(BaseModel):
@@ -293,6 +298,8 @@ async def search_files(
     chunks = await retrieve_rag_chunks(current_user.id, request.query, force=True)
     return [
         RagSearchResult(
+            chunk_id=chunk.id,
+            chunk_index=chunk.chunk_index,
             file_id=chunk.file_id,
             filename=chunk.filename,
             page_start=chunk.page_start,
@@ -300,6 +307,9 @@ async def search_files(
             heading_path=chunk.heading_path,
             content=chunk.content,
             score=chunk.score,
+            vector_similarity=chunk.vector_similarity,
+            text_rank=chunk.text_rank,
+            source_types=list(chunk.source_types),
         )
         for chunk in chunks
     ]

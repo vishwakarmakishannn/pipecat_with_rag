@@ -51,3 +51,19 @@ async def test_audio_after_first_audible_frame_passes_unchanged(monkeypatch):
 
     assert delivered == [delivered[0], first, following, stopped]
     assert isinstance(delivered[0], TTSStartedFrame)
+
+
+@pytest.mark.anyio
+async def test_silence_scan_uses_absolute_signed_pcm_threshold(monkeypatch):
+    trimmer = LeadingSilenceTrimmerProcessor(enabled=True, threshold=100, preroll_ms=0)
+    delivered = []
+
+    async def capture(frame, _direction):
+        delivered.append(frame)
+
+    monkeypatch.setattr(trimmer, "push_frame", capture)
+    frame = TTSAudioRawFrame(_pcm([0, -101, 500]), 24000, 1, context_id="turn")
+    await trimmer.process_frame(frame, FrameDirection.DOWNSTREAM)
+
+    assert delivered == [frame]
+    assert frame.audio == _pcm([-101, 500])

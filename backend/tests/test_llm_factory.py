@@ -95,7 +95,7 @@ def test_openai_builder_uses_openai_env_and_tool_configuration(monkeypatch):
         def __init__(self, **kwargs):
             captured.update(kwargs)
 
-    monkeypatch.setattr(openai_llm, "OpenAILLMService", FakeOpenAIService)
+    monkeypatch.setattr(openai_llm, "LatencyBoundOpenAILLMService", FakeOpenAIService)
     monkeypatch.setattr(openai_llm, "load_system_prompt", lambda: "system prompt")
     monkeypatch.setattr(openai_llm, "tool_timeout_seconds", lambda: 3.5)
     monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
@@ -109,3 +109,26 @@ def test_openai_builder_uses_openai_env_and_tool_configuration(monkeypatch):
     assert captured["function_call_timeout_secs"] == 3.5
     assert captured["enable_async_tool_cancellation"] is True
     assert captured["retry_on_timeout"] is False
+
+
+def test_groq_builder_does_not_treat_temperature_as_latency_control(monkeypatch):
+    from providers.llm import groq_llm
+
+    captured = {}
+
+    class FakeSettings:
+        def __init__(self, **kwargs):
+            self.values = kwargs
+
+    class FakeGroqService:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(groq_llm, "GroqLLMSettings", FakeSettings)
+    monkeypatch.setattr(groq_llm, "LatencyBoundGroqLLMService", FakeGroqService)
+    monkeypatch.setattr(groq_llm, "load_system_prompt", lambda: "system prompt")
+    monkeypatch.setenv("GROQ_API_KEY", "groq-key")
+
+    groq_llm.get_groq_llm()
+
+    assert "temperature" not in captured["settings"].values

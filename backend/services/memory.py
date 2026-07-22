@@ -225,7 +225,8 @@ async def _load_recent_messages_in_session(conversation_id: int, limit: int) -> 
         return await _load_recent_messages(db, conversation_id, limit)
 
 
-async def load_memory_bundle(body: Any, recent_limit: int = RECENT_MESSAGE_LIMIT) -> MemoryBundle | None:
+async def load_session_bundle(body: Any) -> MemoryBundle | None:
+    """Authenticate and resolve the conversation without optional history I/O."""
     request_body = normalize_runner_body(body)
     token = request_body.get("token")
     conversation_id = request_body.get("conversation_id")
@@ -259,20 +260,42 @@ async def load_memory_bundle(body: Any, recent_limit: int = RECENT_MESSAGE_LIMIT
 
         user_id = user.id
 
-    facts, recent_messages = await asyncio.gather(
-        _load_active_facts(user_id),
-        _load_recent_messages_in_session(conversation_id, recent_limit),
-    )
-
     return MemoryBundle(
         user=user,
         primary_conversation=conversation,
-        facts=facts,
+        facts=[],
         primary_summary=conversation.summary or "",
-        primary_recent_messages=recent_messages,
+        primary_recent_messages=[],
         prior_conversation=None,
         prior_recent_messages=None,
     )
+
+
+async def hydrate_memory_bundle(
+    bundle: MemoryBundle,
+    recent_limit: int = RECENT_MESSAGE_LIMIT,
+) -> MemoryBundle:
+    facts, recent_messages = await asyncio.gather(
+        _load_active_facts(bundle.user.id),
+        _load_recent_messages_in_session(bundle.conversation.id, recent_limit),
+    )
+    return MemoryBundle(
+        user=bundle.user,
+        primary_conversation=bundle.primary_conversation,
+        facts=facts,
+        primary_summary=bundle.primary_summary,
+        primary_recent_messages=recent_messages,
+        prior_conversation=bundle.prior_conversation,
+        prior_recent_messages=bundle.prior_recent_messages,
+    )
+
+
+async def load_memory_bundle(body: Any, recent_limit: int = RECENT_MESSAGE_LIMIT) -> MemoryBundle | None:
+    """Compatibility helper for callers that require fully hydrated memory."""
+    bundle = await load_session_bundle(body)
+    if bundle is None:
+        return None
+    return await hydrate_memory_bundle(bundle, recent_limit)
 
 
 def message_to_llm(message: Message) -> dict[str, str] | None:
@@ -848,7 +871,7 @@ async def store_memory_chunk(
     return stored.scalars().first()
 
 
-def _is_recall_query(query: str) -> bool:
+def is_recall_query(query: str) -> bool:
     lowered = query.lower()
     recall_terms = [
         "what did",
@@ -873,7 +896,7 @@ async def retrieve_semantic_memories(
     top_k: int = MEMORY_RECALL_TOP_K,
     query_embedding=None,
 ) -> list[tuple[MemoryChunk, float]]:
-    if not _is_recall_query(query):
+    if not is_recall_query(query):
         return []
 
     if isinstance(query_embedding, asyncio.Future) or asyncio.iscoroutine(query_embedding):
@@ -911,6 +934,36 @@ async def build_turn_memory_context(
     query_embedding=None,
     current_conversation_id: int | None = None,
 ) -> str | None:
+    # Questions about the immediately preceding chat have a deterministic,
+    # local answer. Prefer that path over a remote embedding so cross-chat
+    # recall remains reliable inside the voice latency budget.
+    if is_recall_query(query) and current_conversation_id is not None:
+        async with VoiceSessionLocal() as db:
+            prior_conversation = await _load_most_recent_prior_conversation(
+                db,
+                user_id,
+                current_conversation_id,
+            )
+            prior_messages = (
+                await _load_recent_messages(
+                    db,
+                    prior_conversation.id,
+                    PRIOR_CONVERSATION_MESSAGE_LIMIT,
+                )
+                if prior_conversation
+                else []
+            )
+        if prior_messages:
+            lines = [
+                "Relevant recent prior conversation retrieved on explicit recall. "
+                "Use it only to answer the current recall question."
+            ]
+            lines.extend(
+                f"- {'User' if message.role == 'You' else 'Aura'}: {message.content}"
+                for message in prior_messages
+            )
+            return "\n".join(lines)[:MEMORY_PRIOR_MAX_CHARS]
+
     memories = await retrieve_semantic_memories(
         user_id,
         query,
@@ -918,7 +971,7 @@ async def build_turn_memory_context(
         query_embedding=query_embedding,
     )
     if not memories:
-        if not _is_recall_query(query):
+        if not is_recall_query(query):
             return None
         async with VoiceSessionLocal() as db:
             prior_conversation = await _load_most_recent_prior_conversation(
@@ -1021,7 +1074,13 @@ async def save_conversation_message(
         await db.refresh(message)
         
     from core.task_queue import task_queue
-    task_queue.enqueue(_process_saved_message_background, conversation_id, message.id, key=conversation_id)
+    task_queue.enqueue(
+        _process_saved_message_background,
+        conversation_id,
+        message.id,
+        key=conversation_id,
+        enrichment=True,
+    )
     return message
 
 
@@ -1044,4 +1103,10 @@ async def _process_saved_message_background(conversation_id: int, message_id: in
 
 async def process_saved_message(db: AsyncSession, conversation: Conversation, message: Message) -> None:
     from core.task_queue import task_queue
-    task_queue.enqueue(_process_saved_message_background, conversation.id, message.id, key=conversation.id)
+    task_queue.enqueue(
+        _process_saved_message_background,
+        conversation.id,
+        message.id,
+        key=conversation.id,
+        enrichment=True,
+    )

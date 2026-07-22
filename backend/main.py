@@ -27,10 +27,8 @@ import time
 
 from dotenv import load_dotenv
 from loguru import logger
-from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
-from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.frames.frames import (
     Frame,
     LLMFullResponseEndFrame,
@@ -58,14 +56,22 @@ from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
 from pipecat.workers.runner import WorkerRunner
 from pipecat.turns.user_turn_strategies import UserTurnStrategies, TurnAnalyzerUserTurnStopStrategy
-from services.memory import build_memory_messages, build_turn_memory_context, load_memory_bundle, save_conversation_message
+from services.memory import build_memory_messages, build_turn_memory_context, hydrate_memory_bundle, load_session_bundle, save_conversation_message
 from core.memory_config import MEMORY_EMBEDDING_DIMENSION
 from services.rag import build_rag_context_with_payload, is_rag_query
 from core.rag_config import RAG_VOICE_QUERY_WINDOW_SECONDS
 from core.voice_config import load_endpointing_config, startup_greeting
-from core.voice_services import initialize_voice_services
+from core.voice_services import initialize_voice_runtime
 from core.audio_config import audio_input_sample_rate, audio_out_10ms_chunks, audio_output_sample_rate
+from core.turn_analyzer import (
+    SharedModelSileroVADAnalyzer,
+    SharedModelSmartTurnAnalyzerV3,
+    warm_silero_vad_model,
+    warm_smart_turn_model,
+)
 from core.admission import voice_admission
+from core.latency_observer import PipelineLatencyObserver, event_loop_lag_monitor
+from core.realtime_gate import realtime_turn_gate
 from tools.tavily import run_web_search, tavily_search
 from tools.raise_issue import raise_issue
 
@@ -81,6 +87,7 @@ from core.processors import (
     LatencyBoundaryProcessor,
     BoundedContextProcessor,
     ToolRoutingProcessor,
+    transport_server_message,
 )
 
 
@@ -98,9 +105,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
 
     # Constructors may load ONNX/Piper models or initialize provider clients.
     # They are independent, so keep them off the event loop and overlap them.
-    stt, tts, llm = await initialize_voice_services(get_stt, get_tts, get_llm)
-
-    memory_bundle = await load_memory_bundle(runner_args.body)
+    (stt, tts, llm), memory_bundle = await initialize_voice_runtime(
+        get_stt, get_tts, get_llm,
+        load_session_bundle, runner_args.body,
+    )
     memory_messages = build_memory_messages(memory_bundle)
     if memory_bundle:
         logger.info(
@@ -123,10 +131,32 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     context_window = BoundedContextProcessor(
         context,
         protected_messages=memory_messages,
-        max_messages=int(os.getenv("VOICE_CONTEXT_MAX_MESSAGES", "24")),
-        max_chars=int(os.getenv("VOICE_CONTEXT_MAX_CHARS", "18000")),
+        max_messages=int(os.getenv("VOICE_CONTEXT_MAX_MESSAGES", "12")),
+        max_chars=int(os.getenv("VOICE_CONTEXT_MAX_CHARS", "6000")),
         name="BoundedContext",
     )
+
+    async def install_optional_memory():
+        if not memory_bundle:
+            return
+        try:
+            hydrated = await hydrate_memory_bundle(memory_bundle)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Optional session memory hydration failed: {!r}", exc)
+            return
+        hydrated_messages = build_memory_messages(hydrated)
+        if not hydrated_messages:
+            return
+        if any(message.get("role") == "user" for message in context.messages if isinstance(message, dict)):
+            logger.info("Optional session memory arrived after first user turn; skipping foreground install")
+            return
+        context.messages[0:0] = hydrated_messages
+        context_window.protect_messages(hydrated_messages)
+        logger.info("Installed {} asynchronously hydrated memory messages", len(hydrated_messages))
+
+    memory_hydration_task = asyncio.create_task(install_optional_memory())
     latency_state = TurnLatencyState(session_id=getattr(runner_args, "session_id", None))
     context_retrieval = ContextRetrievalProcessor(
         user_id,
@@ -160,7 +190,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     user_turn_strategies = UserTurnStrategies(
         stop=[
             TurnAnalyzerUserTurnStopStrategy(
-                turn_analyzer=LocalSmartTurnAnalyzerV3(
+                turn_analyzer=SharedModelSmartTurnAnalyzerV3(
                     params=SmartTurnParams(
                         stop_secs=endpointing.smart_turn_stop_secs,
                         pre_speech_ms=endpointing.smart_turn_pre_speech_ms,
@@ -173,7 +203,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(
+            vad_analyzer=SharedModelSileroVADAnalyzer(
                 params=VADParams(
                     confidence=endpointing.vad_confidence,
                     start_secs=endpointing.vad_start_secs,
@@ -208,11 +238,12 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     pipeline = Pipeline(
         [
             transport.input(),
+            LatencyBoundaryProcessor(latency_state, "vad", name="PostVADLatency"),
             stt,
             LatencyBoundaryProcessor(latency_state, "stt", name="PostSTTLatency"),
-            context_retrieval,
             user_aggregator,
             LatencyBoundaryProcessor(latency_state, "turn", name="PostTurnLatency"),
+            context_retrieval,
             tool_router,
             context_window,
             llm,
@@ -235,9 +266,12 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
             enable_usage_metrics=True,
         ),
         rtvi_observer_params=RTVIObserverParams(
-            function_call_report_level={"*": RTVIFunctionCallReportLevel.FULL}
+            # Tool lifecycle UI events are emitted explicitly so filler always
+            # appears first and provider-specific frame direction cannot hide them.
+            function_call_report_level={"*": RTVIFunctionCallReportLevel.DISABLED}
         ),
-        observers=[],
+        app_resources={"latency_state": latency_state},
+        observers=[PipelineLatencyObserver()],
     )
 
     @worker.rtvi.event_handler("on_client_ready")
@@ -256,6 +290,14 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
             }))
         greeting = startup_greeting()
         if greeting:
+            startup_frames.append(transport_server_message(
+                "assistant_transcript",
+                {
+                    "id": "startup-greeting",
+                    "text": greeting,
+                    "source": "greeting",
+                },
+            ))
             startup_frames.append(TTSSpeakFrame(greeting, append_to_context=False))
         if startup_frames:
             await worker.queue_frames(startup_frames)
@@ -271,8 +313,14 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
 
     runner = WorkerRunner(handle_sigint=False)
 
-    await runner.add_workers(worker)
-    await runner.run()
+    try:
+        await runner.add_workers(worker)
+        await runner.run()
+    finally:
+        realtime_turn_gate.end(latency_state.priority_key)
+        if not memory_hydration_task.done():
+            memory_hydration_task.cancel()
+        await asyncio.gather(memory_hydration_task, return_exceptions=True)
 
 
 async def bot(runner_args: RunnerArguments):
@@ -326,9 +374,16 @@ async def liveness_probe():
 @health_router.get("/health/ready")
 async def readiness_probe():
     from core.task_queue import task_queue
+    from core.readiness import validate_voice_provider_configuration
 
     if not task_queue.is_running:
         raise HTTPException(status_code=503, detail="background workers are not ready")
+
+    try:
+        providers = validate_voice_provider_configuration()
+    except ValueError as exc:
+        logger.warning("readiness voice provider configuration failed: {}", exc)
+        raise HTTPException(status_code=503, detail=f"voice providers are not ready: {exc}") from exc
 
     async def check_database():
         async with engine.connect() as connection:
@@ -340,11 +395,18 @@ async def readiness_probe():
         logger.warning("readiness database check failed: {}", exc)
         raise HTTPException(status_code=503, detail="database is not ready") from exc
 
-    return {"status": "ready", "database": "ready", "workers": "ready"}
+    return {
+        "status": "ready",
+        "database": "ready",
+        "workers": "ready",
+        "voice_providers": providers,
+    }
 
 
 
 if __name__ == "__main__":
+    from core.logging_config import configure_nonblocking_logging
+    configure_nonblocking_logging()
     from pipecat.runner.run import app, main
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import JSONResponse
@@ -392,9 +454,21 @@ if __name__ == "__main__":
     @asynccontextmanager
     async def lifespan(app):
         from core.task_queue import task_queue
+        from core.database import warm_voice_pool
+        # pipecat.runner.run.main() installs its own synchronous DEBUG sink
+        # immediately before Uvicorn starts. Reassert the bounded production
+        # sink here, after that override and before latency-critical work.
+        configure_nonblocking_logging(force=True)
+        await asyncio.gather(
+            asyncio.to_thread(warm_smart_turn_model),
+            asyncio.to_thread(warm_silero_vad_model),
+            warm_voice_pool(int(os.getenv("DB_VOICE_WARM_CONNECTIONS", "2"))),
+        )
+        event_loop_lag_monitor.start()
         task_queue.start(num_workers=3)
         yield
         await task_queue.stop()
+        await event_loop_lag_monitor.stop()
 
     app.router.lifespan_context = lifespan
 

@@ -70,6 +70,51 @@ async def test_prior_conversation_is_loaded_only_on_explicit_recall(monkeypatch)
     assert prior_calls == 1
 
 
+@pytest.mark.anyio
+async def test_current_chat_recall_prefers_prior_messages_without_embedding(monkeypatch):
+    prior = Conversation(id=10, user_id=1, title="Previous chat")
+    semantic_calls = 0
+
+    async def semantic(*_args, **_kwargs):
+        nonlocal semantic_calls
+        semantic_calls += 1
+        await asyncio.sleep(10)
+
+    async def load_prior(*_args, **_kwargs):
+        return prior
+
+    async def load_messages(*_args, **_kwargs):
+        return [
+            Message(role="You", content="Tell me about solar panels."),
+            Message(role="Aura", content="We discussed rooftop solar costs."),
+        ]
+
+    class SessionContext:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(memory_service, "retrieve_semantic_memories", semantic)
+    monkeypatch.setattr(memory_service, "_load_most_recent_prior_conversation", load_prior)
+    monkeypatch.setattr(memory_service, "_load_recent_messages", load_messages)
+    monkeypatch.setattr(memory_service, "VoiceSessionLocal", SessionContext)
+
+    context = await asyncio.wait_for(
+        build_turn_memory_context(
+            1,
+            "What were we talking about previously?",
+            current_conversation_id=11,
+        ),
+        timeout=0.1,
+    )
+
+    assert "Tell me about solar panels." in context
+    assert "rooftop solar costs" in context
+    assert semantic_calls == 0
+
+
 def test_build_memory_messages_ignores_invalid_name_memory():
     bundle = MemoryBundle(
         user=User(id=1, username="kishan", password_hash="x"),

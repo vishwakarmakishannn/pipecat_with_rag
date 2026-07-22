@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import ipaddress
+import math
 import uuid
 import os
 import re
@@ -29,6 +30,7 @@ from core.rag_config import (
     RAG_LINK_EXTRACTOR,
     RAG_LINK_FALLBACK_EXTRACTOR,
     RAG_LINK_MAX_BYTES,
+    RAG_LINK_MAX_DENSE_LINKS,
     RAG_LINK_MIN_CHARS,
     RAG_LINK_RESPECT_ROBOTS,
     RAG_LINK_TIMEOUT_SECONDS,
@@ -38,9 +40,15 @@ from core.rag_config import (
     RAG_MIN_CONTENT_CHARS,
     RAG_MIN_STRONG_MATCHES,
     RAG_MIN_TEXT_RANK,
+    RAG_MIN_FINAL_SCORE,
     RAG_MIN_VECTOR_SIMILARITY,
     RAG_RETRIEVAL_TOP_K,
     RAG_RRF_K,
+    RAG_RERANKER,
+    RAG_RERANK_EXACT_METADATA_BOOST,
+    RAG_RERANK_HEADING_WEIGHT,
+    RAG_RERANK_TEXT_WEIGHT,
+    RAG_RERANK_VECTOR_WEIGHT,
     RAG_SMART_ROUTER,
     RAG_TEXT_CANDIDATES,
     RAG_TEXT_MATCH_MIN_RANK,
@@ -85,6 +93,7 @@ def clear_rag_result_cache() -> None:
 class ParsedChunk:
     content: str
     embedding_text: str
+    search_text: str | None = None
     page_start: int | None = None
     page_end: int | None = None
     heading_path: str | None = None
@@ -108,6 +117,7 @@ class RetrievedRagChunk:
     page_end: int | None
     heading_path: str | None
     score: float
+    chunk_index: int | None = None
     vector_similarity: float | None = None
     text_rank: float | None = None
     source_types: tuple[str, ...] = ()
@@ -123,9 +133,13 @@ def is_rag_query(query: str) -> bool:
 
 
 def should_attempt_rag_retrieval(query: str) -> bool:
-    """Only explicit source-grounding turns pay live embedding/SQL cost."""
-    normalized = re.sub(r"\s+", " ", (query or "").strip().lower())
-    return bool(normalized) and is_rag_query(normalized)
+    """Attempt retrieval from query shape, not a brittle list of source phrases.
+
+    Evidence gating later decides whether corpus content is relevant enough to
+    inject. This lets users refer to saved material in unanticipated language.
+    """
+    normalized = re.sub(r"\s+", " ", (query or "").strip())
+    return len(normalized) >= 3 and bool(re.search(r"[\w\d]", normalized, re.UNICODE))
 
 
 # rag_storage_path and rag_link_storage_path removed as they are now handled by core.storage
@@ -260,6 +274,33 @@ def _normalize_markdown(value: str) -> str:
     return value.strip()
 
 
+def _plain_markdown(value: str) -> str:
+    value = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", value or "")
+    value = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", value)
+    value = re.sub(r"<https?://[^>]+>", " ", value)
+    value = re.sub(r"https?://\S+", " ", value)
+    value = re.sub(r"[*_`#>|]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _is_low_value_link_section(content: str) -> bool:
+    """Reject dense page chrome while retaining ordinary linked article lists."""
+    links = re.findall(r"\[[^\]]+\]\([^)]*\)", content or "")
+    if not links:
+        return False
+    plain = _plain_markdown(content)
+    average_text_per_link = len(plain) / len(links)
+    return (
+        len(links) >= RAG_LINK_MAX_DENSE_LINKS
+        and average_text_per_link < 100
+    )
+
+
+def _chunk_fingerprint(value: str) -> str:
+    normalized = re.sub(r"\W+", " ", _plain_markdown(value).lower()).strip()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
 def _split_markdown_section(text: str, limit: int, overlap: int) -> list[str]:
     text = re.sub(r"\s+", " ", text or "").strip()
     if not text:
@@ -303,29 +344,40 @@ def chunk_link_markdown(markdown: str, title: str | None, final_url: str) -> lis
         sections.append((current_heading, current_lines))
 
     parsed_chunks = []
+    seen_fingerprints: set[str] = set()
     for heading, section_lines in sections:
         section_text = _normalize_markdown("\n".join(section_lines))
+        if _is_low_value_link_section(section_text):
+            continue
+        clean_heading = _plain_markdown(heading or "") or None
         for chunk_text in _split_markdown_section(
             section_text,
             RAG_LINK_CHUNK_CHARS,
             RAG_LINK_CHUNK_OVERLAP,
         ):
-            heading_bits = [bit for bit in [title, heading] if bit]
+            clean_content = _plain_markdown(chunk_text)
+            if len(clean_content) < RAG_MIN_CONTENT_CHARS:
+                continue
+            fingerprint = _chunk_fingerprint(clean_content)
+            if fingerprint in seen_fingerprints:
+                continue
+            seen_fingerprints.add(fingerprint)
+            heading_bits = [bit for bit in [title, clean_heading] if bit]
             heading_path = " > ".join(heading_bits) if heading_bits else None
-            embedding_text = "\n".join(
+            retrieval_text = "\n".join(
                 part
                 for part in [
                     f"Title: {title}" if title else None,
-                    f"URL: {final_url}",
-                    f"Heading: {heading}" if heading else None,
-                    chunk_text,
+                    f"Heading: {clean_heading}" if clean_heading else None,
+                    clean_content,
                 ]
                 if part
             )
             parsed_chunks.append(
                 ParsedChunk(
-                    content=chunk_text,
-                    embedding_text=embedding_text,
+                    content=clean_content,
+                    embedding_text=retrieval_text,
+                    search_text=retrieval_text,
                     heading_path=heading_path,
                 )
             )
@@ -521,7 +573,10 @@ async def process_rag_file(file_id: int) -> None:
                         heading_path=parsed.heading_path,
                         content=parsed.content,
                         embedding=embedding,
-                        search_vector=func.to_tsvector(literal_column("'english'"), parsed.content),
+                        search_vector=func.to_tsvector(
+                            literal_column("'english'"),
+                            parsed.search_text or parsed.embedding_text or parsed.content,
+                        ),
                     )
                 )
 
@@ -558,6 +613,109 @@ def _rrf(rank: int) -> float:
     return 1.0 / (RAG_RRF_K + rank)
 
 
+_YEAR_TENS = {
+    "twenty": 20,
+    "thirty": 30,
+    "forty": 40,
+    "fifty": 50,
+    "sixty": 60,
+    "seventy": 70,
+    "eighty": 80,
+    "ninety": 90,
+}
+_YEAR_ONES = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+}
+
+
+def normalize_retrieval_query(query: str) -> str:
+    """Canonicalize voice-friendly year expressions without domain phrases."""
+    value = re.sub(r"\s+", " ", (query or "").strip().lower())
+    tens_pattern = "|".join(_YEAR_TENS)
+    ones_pattern = "|".join(_YEAR_ONES)
+
+    def century_year(match: re.Match) -> str:
+        century = 2000 if match.group(1) == "twenty" else 1900
+        return str(century + _YEAR_TENS[match.group(2)] + _YEAR_ONES.get(match.group(3), 0))
+
+    value = re.sub(
+        rf"\b(twenty|nineteen)\s+({tens_pattern})(?:\s+({ones_pattern}))?\b",
+        century_year,
+        value,
+    )
+
+    def two_thousand_year(match: re.Match) -> str:
+        return str(2000 + _YEAR_TENS.get(match.group(1), 0) + _YEAR_ONES.get(match.group(2), 0))
+
+    value = re.sub(
+        rf"\btwo\s+thousand(?:\s+and)?(?:\s+({tens_pattern}))?(?:\s+({ones_pattern}))?\b",
+        two_thousand_year,
+        value,
+    )
+    return value
+
+
+_QUERY_STOPWORDS = {
+    "a", "an", "and", "are", "according", "article", "document", "documents",
+    "file", "files", "from", "i", "in", "ingested", "is", "it", "link", "my",
+    "of", "on", "please", "saved", "source", "the", "to", "uploaded", "what",
+    "which", "who", "year",
+}
+
+
+def _retrieval_terms(value: str) -> set[str]:
+    normalized = normalize_retrieval_query(value)
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", normalized)
+        if len(token) > 1 and token not in _QUERY_STOPWORDS
+    }
+
+
+def _candidate_relevance(item: dict[str, Any], query: str) -> float:
+    chunk = item["chunk"]
+    heading = chunk.heading_path or ""
+    query_terms = _retrieval_terms(query)
+    heading_terms = _retrieval_terms(heading)
+    content_terms = _retrieval_terms(chunk.content)
+    searchable_terms = heading_terms | content_terms
+    overlap = (
+        len(query_terms & searchable_terms) / len(query_terms)
+        if query_terms else 0.0
+    )
+
+    vector_similarity = item.get("vector_similarity")
+    vector_component = max(0.0, min(1.0, vector_similarity or 0.0))
+    text_rank = max(0.0, item.get("text_rank") or 0.0)
+    text_component = 1.0 - math.exp(-text_rank)
+
+    query_numbers = {term for term in query_terms if term.isdigit()}
+    exact_metadata = bool(query_numbers) and query_numbers.issubset(heading_terms)
+    missing_metadata_penalty = (
+        RAG_RERANK_EXACT_METADATA_BOOST
+        if query_numbers and not (query_numbers & searchable_terms)
+        else 0.0
+    )
+    boilerplate_penalty = 0.25 if _is_low_value_link_section(chunk.content) else 0.0
+
+    return (
+        RAG_RERANK_VECTOR_WEIGHT * vector_component
+        + RAG_RERANK_TEXT_WEIGHT * text_component
+        + RAG_RERANK_HEADING_WEIGHT * overlap
+        + (RAG_RERANK_EXACT_METADATA_BOOST if exact_metadata else 0.0)
+        - missing_metadata_penalty
+        - boilerplate_penalty
+    )
+
+
 def _vector_similarity(distance: Any) -> float | None:
     if distance is None:
         return None
@@ -568,6 +726,8 @@ def _vector_similarity(distance: Any) -> float | None:
 
 
 def _is_strong_rag_match(chunk: RetrievedRagChunk) -> bool:
+    if RAG_RERANKER == "lightweight":
+        return chunk.score >= RAG_MIN_FINAL_SCORE
     if chunk.vector_similarity is not None and chunk.vector_similarity >= RAG_MIN_VECTOR_SIMILARITY:
         return True
     if chunk.text_rank is not None and chunk.text_rank >= RAG_MIN_TEXT_RANK:
@@ -584,11 +744,6 @@ def should_inject_rag_context(
         return bool(chunks)
     if not chunks:
         return False
-    if RAG_SMART_ROUTER == "off":
-        return is_rag_query(query)
-    if is_rag_query(query):
-        return True
-
     strong_matches = sum(1 for chunk in chunks if _is_strong_rag_match(chunk))
     return strong_matches >= RAG_MIN_STRONG_MATCHES
 
@@ -650,13 +805,14 @@ async def _retrieve_rag_chunks_uncached(
     query_embedding=_EMBEDDING_UNSET,
 ) -> list[RetrievedRagChunk]:
     merged: dict[int, dict[str, Any]] = {}
+    normalized_query = normalize_retrieval_query(query)
 
     # Lexical retrieval has no embedding dependency. Start it immediately so
     # remote embedding latency and PostgreSQL FTS latency overlap.
-    text_task = asyncio.create_task(_retrieve_text_candidates(user_id, query))
+    text_task = asyncio.create_task(_retrieve_text_candidates(user_id, normalized_query))
     try:
         if query_embedding is _EMBEDDING_UNSET:
-            embedding = await embed_text(query)
+            embedding = await embed_text(normalized_query)
         elif isinstance(query_embedding, asyncio.Future) or asyncio.iscoroutine(query_embedding):
             embedding = await query_embedding
         else:
@@ -713,7 +869,10 @@ async def _retrieve_rag_chunks_uncached(
         ) if item["text_rank"] is not None or rank_value is not None else None
         item["source_types"].add("text")
 
-    ranked = sorted(merged.values(), key=lambda item: item["score"], reverse=True)[:top_k]
+    if RAG_RERANKER == "lightweight":
+        for item in merged.values():
+            item["score"] = _candidate_relevance(item, normalized_query)
+    ranked = sorted(merged.values(), key=lambda item: item["score"], reverse=True)
     chunks = [
         RetrievedRagChunk(
             id=item["chunk"].id,
@@ -724,6 +883,7 @@ async def _retrieve_rag_chunks_uncached(
             page_end=item["chunk"].page_end,
             heading_path=item["chunk"].heading_path,
             score=item["score"],
+            chunk_index=item["chunk"].chunk_index,
             vector_similarity=item["vector_similarity"],
             text_rank=item["text_rank"],
             source_types=tuple(sorted(item["source_types"])),
@@ -746,14 +906,23 @@ async def _retrieve_rag_chunks_uncached(
         return []
 
     if force:
-        selected = chunks
+        selected = chunks[:top_k]
     else:
         selected = [chunk for chunk in chunks if _is_strong_rag_match(chunk)]
-        if is_rag_query(query) and not selected and chunks:
-            selected = chunks[:1]
+        deduplicated: list[RetrievedRagChunk] = []
+        seen_content: set[str] = set()
+        for chunk in selected:
+            fingerprint = _chunk_fingerprint(chunk.content)
+            if fingerprint in seen_content:
+                continue
+            seen_content.add(fingerprint)
+            deduplicated.append(chunk)
+        selected = deduplicated[:top_k]
     selected_count, selected_similarity, selected_text_rank = _rag_stats(selected)
     selected_sources = ", ".join(
-        f"{chunk.filename}:{_format_pages(chunk)}" for chunk in selected[:top_k]
+        f"id={chunk.id}/index={chunk.chunk_index}/score={chunk.score:.3f}/"
+        f"vector={chunk.vector_similarity}/text={chunk.text_rank}/heading={chunk.heading_path!r}"
+        for chunk in selected[:top_k]
     )
     logger.info(
         "RAG injected: "
@@ -761,7 +930,23 @@ async def _retrieve_rag_chunks_uncached(
         f"best_vector_similarity={selected_similarity} best_text_rank={selected_text_rank} "
         f"sources={selected_sources}"
     )
-    return selected[:top_k]
+    if ranked:
+        logger.debug(
+            "RAG ranking query={!r} top_candidates={}",
+            normalized_query,
+            [
+                {
+                    "id": item["chunk"].id,
+                    "index": item["chunk"].chunk_index,
+                    "score": round(item["score"], 4),
+                    "vector": item["vector_similarity"],
+                    "text": item["text_rank"],
+                    "heading": item["chunk"].heading_path,
+                }
+                for item in ranked[:10]
+            ],
+        )
+    return selected
 
 
 async def retrieve_rag_chunks(
@@ -875,6 +1060,7 @@ def build_rag_call_payload(query: str, chunks: list[RetrievedRagChunk]) -> dict[
             "chunks": [
                 {
                     "id": chunk.id,
+                    "chunk_index": chunk.chunk_index,
                     "file_id": chunk.file_id,
                     "source_type": chunk.source_type,
                     "filename": chunk.filename,
@@ -884,7 +1070,10 @@ def build_rag_call_payload(query: str, chunks: list[RetrievedRagChunk]) -> dict[
                     "page_start": chunk.page_start,
                     "page_end": chunk.page_end,
                     "heading_path": chunk.heading_path,
-                    "content": _truncate(chunk.content, 240),
+                    # The transcript is an audit/debug view of the retrieved
+                    # chunk, so preserve the stored content verbatim. Prompt
+                    # size remains independently bounded by format_rag_context.
+                    "content": chunk.content,
                     "score": chunk.score,
                     "vector_similarity": chunk.vector_similarity,
                     "text_rank": chunk.text_rank,

@@ -30,3 +30,29 @@ async def test_voice_service_constructors_are_scheduled_together(monkeypatch):
     assert len(scheduled) == 3
     release.set()
     assert await task == ("stt", "tts", "llm")
+
+
+@pytest.mark.anyio
+async def test_session_identity_and_services_start_concurrently(monkeypatch):
+    services_started = asyncio.Event()
+    session_started = asyncio.Event()
+
+    async def fake_services(*_factories):
+        services_started.set()
+        await asyncio.wait_for(session_started.wait(), timeout=0.2)
+        return "stt", "tts", "llm"
+
+    async def load_session(body):
+        assert body == {"token": "x"}
+        session_started.set()
+        await asyncio.wait_for(services_started.wait(), timeout=0.2)
+        return "session"
+
+    monkeypatch.setattr(voice_services, "initialize_voice_services", fake_services)
+    services, session = await voice_services.initialize_voice_runtime(
+        lambda: None, lambda: None, lambda: None,
+        load_session, {"token": "x"},
+    )
+
+    assert services == ("stt", "tts", "llm")
+    assert session == "session"

@@ -14,6 +14,8 @@ class VoiceAdmissionController:
         self.limit = configured
         self._active = 0
         self._lock = asyncio.Lock()
+        self._idle = asyncio.Event()
+        self._idle.set()
 
     @property
     def active(self) -> int:
@@ -28,6 +30,7 @@ class VoiceAdmissionController:
             if self._active >= self.limit:
                 return False
             self._active += 1
+            self._idle.clear()
             return True
 
     async def release(self) -> None:
@@ -35,6 +38,12 @@ class VoiceAdmissionController:
             if self._active <= 0:
                 raise RuntimeError("voice admission release without an active lease")
             self._active -= 1
+            if self._active == 0:
+                self._idle.set()
+
+    async def wait_until_idle(self) -> None:
+        """Wait until no latency-sensitive voice pipeline is active."""
+        await self._idle.wait()
 
 
 voice_admission = VoiceAdmissionController()

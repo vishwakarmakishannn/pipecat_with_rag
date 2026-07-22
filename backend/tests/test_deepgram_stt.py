@@ -161,7 +161,7 @@ async def test_disconnected_media_is_buffered_and_replayed_in_order():
     service._connection = connection
     await service._flush_media_buffer()
 
-    assert connection.media == [b"first", b"second"]
+    assert connection.media == [b"firstsecond"]
     assert not service._reconnect_media_buffer
     service._media_recovery_task.cancel()
     await asyncio.gather(service._media_recovery_task, return_exceptions=True)
@@ -178,6 +178,42 @@ def test_reconnect_buffer_drops_oldest_audio_when_bounded():
     service._buffer_media(b"2222")
 
     assert list(service._reconnect_media_buffer) == [b"2222"]
+
+
+def test_reconnect_buffer_drops_audio_older_than_age_limit(monkeypatch):
+    service = object.__new__(ResilientDeepgramSTTService)
+    service._name = "TestDeepgramSTT"
+    service._reconnect_media_buffer = __import__("collections").deque()
+    service._reconnect_media_timestamps = __import__("collections").deque()
+    service._reconnect_media_bytes = 0
+    service._reconnect_media_max_bytes = 1024
+    service._reconnect_media_max_age_seconds = 1
+    times = iter([10.0, 12.0])
+    monkeypatch.setattr("providers.stt.deepgram_stt.time.monotonic", lambda: next(times))
+
+    service._buffer_media(b"stale")
+    service._buffer_media(b"fresh")
+
+    assert list(service._reconnect_media_buffer) == [b"fresh"]
+    assert service._reconnect_media_bytes == len(b"fresh")
+
+
+@pytest.mark.anyio
+async def test_reconnect_replay_uses_bounded_coalesced_batches():
+    service = object.__new__(ResilientDeepgramSTTService)
+    service._name = "TestDeepgramSTT"
+    service._connection = _RecordingConnection()
+    service._reconnect_media_buffer = __import__("collections").deque([b"1111", b"2222", b"3333"])
+    service._reconnect_media_timestamps = __import__("collections").deque([1.0, 1.0, 1.0])
+    service._reconnect_media_bytes = 12
+    service._reconnect_media_max_bytes = 1024
+    service._reconnect_media_max_age_seconds = 1000000000
+    service._reconnect_replay_batch_bytes = 8
+
+    await service._flush_media_buffer()
+
+    assert service._connection.media == [b"11112222", b"3333"]
+    assert service._reconnect_media_bytes == 0
 
 
 @pytest.mark.anyio
@@ -208,3 +244,38 @@ def test_connect_timeout_is_validated(monkeypatch):
     monkeypatch.setenv("STT_CONNECT_TIMEOUT_SECONDS", "60")
     with pytest.raises(ValueError, match="STT_CONNECT_TIMEOUT_SECONDS"):
         ResilientDeepgramSTTService._connect_timeout_seconds()
+
+
+def test_keepalive_interval_is_validated(monkeypatch):
+    monkeypatch.setenv("STT_KEEPALIVE_INTERVAL_SECONDS", "2.5")
+    assert ResilientDeepgramSTTService._keepalive_interval_seconds() == 2.5
+    monkeypatch.setenv("STT_KEEPALIVE_INTERVAL_SECONDS", "0.1")
+    with pytest.raises(ValueError):
+        ResilientDeepgramSTTService._keepalive_interval_seconds()
+
+
+@pytest.mark.anyio
+async def test_abandoned_turn_reset_discards_stale_ttfb_clock(monkeypatch):
+    service = object.__new__(ResilientDeepgramSTTService)
+    service._name = "TestDeepgramSTT"
+    service._metrics = type(
+        "Metrics",
+        (),
+        {"_start_ttfb_time": 10.0, "_ttfa_active": True, "_ttfa_buffer": b"audio"},
+    )()
+    service._last_transcript_time = 12.0
+
+    async def base_reset(_self):
+        return None
+
+    monkeypatch.setattr(
+        "providers.stt.deepgram_stt.DeepgramSTTService._reset_stt_ttfb_state",
+        base_reset,
+    )
+
+    await service._reset_stt_ttfb_state()
+
+    assert service._metrics._start_ttfb_time == 0
+    assert service._metrics._ttfa_active is False
+    assert service._metrics._ttfa_buffer == b""
+    assert service._last_transcript_time == 0

@@ -1,5 +1,6 @@
 import os
 import asyncio
+import time
 from collections import deque
 from loguru import logger
 from deepgram.listen.v1.types.listen_v1keep_alive import ListenV1KeepAlive
@@ -15,9 +16,14 @@ class ResilientDeepgramSTTService(DeepgramSTTService):
         self._keepalive_recovery_task = None
         self._media_recovery_task = None
         self._reconnect_media_buffer = deque()
+        self._reconnect_media_timestamps = deque()
         self._reconnect_media_bytes = 0
         self._reconnect_media_max_bytes = int(
             os.getenv("STT_RECONNECT_BUFFER_MAX_BYTES", "256000")
+        )
+        self._reconnect_media_max_age_seconds = self._buffer_max_age_seconds()
+        self._reconnect_replay_batch_bytes = int(
+            os.getenv("STT_RECONNECT_REPLAY_BATCH_BYTES", "32000")
         )
 
     @staticmethod
@@ -30,6 +36,32 @@ class ResilientDeepgramSTTService(DeepgramSTTService):
         if not 0.25 <= value <= 30:
             raise ValueError(
                 f"STT_CONNECT_TIMEOUT_SECONDS must be between 0.25 and 30, got {value}"
+            )
+        return value
+
+    @staticmethod
+    def _keepalive_interval_seconds() -> float:
+        raw = os.getenv("STT_KEEPALIVE_INTERVAL_SECONDS", "2")
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            raise ValueError(f"STT_KEEPALIVE_INTERVAL_SECONDS must be a number, got {raw!r}") from exc
+        if not 0.5 <= value <= 10:
+            raise ValueError(
+                f"STT_KEEPALIVE_INTERVAL_SECONDS must be between 0.5 and 10, got {value}"
+            )
+        return value
+
+    @staticmethod
+    def _buffer_max_age_seconds() -> float:
+        raw = os.getenv("STT_RECONNECT_BUFFER_MAX_AGE_SECONDS", "2")
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            raise ValueError(f"STT_RECONNECT_BUFFER_MAX_AGE_SECONDS must be a number, got {raw!r}") from exc
+        if not 0.25 <= value <= 10:
+            raise ValueError(
+                f"STT_RECONNECT_BUFFER_MAX_AGE_SECONDS must be between 0.25 and 10, got {value}"
             )
         return value
 
@@ -50,6 +82,17 @@ class ResilientDeepgramSTTService(DeepgramSTTService):
             self._connection_ready.clear()
             raise
 
+    async def _reset_stt_ttfb_state(self):
+        """Cancel abandoned-turn timing without emitting a stale TTFB sample."""
+        await super()._reset_stt_ttfb_state()
+        metrics = getattr(self, "_metrics", None)
+        if metrics is not None and getattr(metrics, "_start_ttfb_time", 0):
+            logger.info("{}: discarded abandoned STT TTFB measurement", self)
+            metrics._start_ttfb_time = 0
+            metrics._ttfa_active = False
+            metrics._ttfa_buffer = b""
+        self._last_transcript_time = 0
+
     def _ensure_media_buffer(self) -> None:
         if not hasattr(self, "_reconnect_media_buffer"):
             self._reconnect_media_buffer = deque()
@@ -57,12 +100,43 @@ class ResilientDeepgramSTTService(DeepgramSTTService):
             self._reconnect_media_max_bytes = int(
                 os.getenv("STT_RECONNECT_BUFFER_MAX_BYTES", "256000")
             )
+        if not hasattr(self, "_reconnect_media_timestamps"):
+            now = time.monotonic()
+            self._reconnect_media_timestamps = deque(
+                now for _ in self._reconnect_media_buffer
+            )
+        if not hasattr(self, "_reconnect_media_max_age_seconds"):
+            self._reconnect_media_max_age_seconds = self._buffer_max_age_seconds()
+        if not hasattr(self, "_reconnect_replay_batch_bytes"):
+            self._reconnect_replay_batch_bytes = int(
+                os.getenv("STT_RECONNECT_REPLAY_BATCH_BYTES", "32000")
+            )
+
+    def _drop_expired_media(self, now: float | None = None) -> int:
+        self._ensure_media_buffer()
+        now = time.monotonic() if now is None else now
+        dropped = 0
+        while (
+            self._reconnect_media_buffer
+            and self._reconnect_media_timestamps
+            and now - self._reconnect_media_timestamps[0] > self._reconnect_media_max_age_seconds
+        ):
+            audio = self._reconnect_media_buffer.popleft()
+            self._reconnect_media_timestamps.popleft()
+            self._reconnect_media_bytes -= len(audio)
+            dropped += len(audio)
+        if dropped:
+            logger.warning("{}: dropped {} expired STT reconnect audio bytes", self, dropped)
+        return dropped
 
     def _buffer_media(self, audio: bytes) -> None:
         self._ensure_media_buffer()
         if not audio:
             return
+        now = time.monotonic()
+        self._drop_expired_media(now)
         self._reconnect_media_buffer.append(audio)
+        self._reconnect_media_timestamps.append(now)
         self._reconnect_media_bytes += len(audio)
         dropped = 0
         while (
@@ -70,6 +144,7 @@ class ResilientDeepgramSTTService(DeepgramSTTService):
             and len(self._reconnect_media_buffer) > 1
         ):
             removed = self._reconnect_media_buffer.popleft()
+            self._reconnect_media_timestamps.popleft()
             self._reconnect_media_bytes -= len(removed)
             dropped += len(removed)
         if dropped:
@@ -84,10 +159,18 @@ class ResilientDeepgramSTTService(DeepgramSTTService):
         connection = self._connection
         if not connection:
             return
+        self._drop_expired_media()
         while self._reconnect_media_buffer:
-            audio = self._reconnect_media_buffer[0]
+            parts = []
+            batch_bytes = 0
+            for audio in self._reconnect_media_buffer:
+                if parts and batch_bytes + len(audio) > self._reconnect_replay_batch_bytes:
+                    break
+                parts.append(audio)
+                batch_bytes += len(audio)
+            payload = b"".join(parts)
             try:
-                await connection.send_media(audio)
+                await connection.send_media(payload)
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -96,8 +179,10 @@ class ResilientDeepgramSTTService(DeepgramSTTService):
                     self._connection_ready.clear()
                 self._schedule_media_recovery(error)
                 return
-            self._reconnect_media_buffer.popleft()
-            self._reconnect_media_bytes -= len(audio)
+            for _ in parts:
+                self._reconnect_media_buffer.popleft()
+                self._reconnect_media_timestamps.popleft()
+            self._reconnect_media_bytes -= batch_bytes
 
     async def _do_reconnect(self):
         # Flush failed/deferred raw media before STTService replays frames that
@@ -115,7 +200,7 @@ class ResilientDeepgramSTTService(DeepgramSTTService):
 
     async def _keepalive_handler(self):
         while True:
-            await asyncio.sleep(5)
+            await asyncio.sleep(self._keepalive_interval_seconds())
             connection = self._connection
             if not connection:
                 continue

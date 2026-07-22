@@ -7,18 +7,29 @@ import {
   usePipecatClientMicControl,
   usePipecatClientTransportState,
   useRTVIClientEvent,
-  VoiceVisualizer,
 } from '@pipecat-ai/client-react';
 import { SmallWebRTCTransport } from '@pipecat-ai/small-webrtc-transport';
-import { Mic, Volume2, X } from 'lucide-react';
+import { Mic, Moon, Send, Sun, Volume2, X } from 'lucide-react';
 import { jwtDecode } from 'jwt-decode';
 import { fetchWithAuth, API_BASE } from './utils/api';
-import { buildAudioConstraints, buildIceServers, localSpeechLevelThreshold } from './utils/webrtc';
+import { buildAudioConstraints, buildIceServers, localSpeechLevelThreshold, webRTCConnectTimeoutMs } from './utils/webrtc';
+import { collectWebRTCAudioStats, createSessionTelemetry, ensureBotAudioPlayback, monitorPeerConnection, publishSessionTelemetry, recordCaptureTrack, recordSelectedCandidatePair, withConnectionDeadline } from './utils/sessionTelemetry';
 import './App.css';
 
 const START_ENDPOINT =
   import.meta.env.VITE_PIPECAT_START_URL ||
   `${API_BASE}/start`;
+
+const MAX_TRANSCRIPT_ITEMS = (() => {
+  const value = Number(import.meta.env.VITE_MAX_TRANSCRIPT_ITEMS || 250);
+  return Number.isInteger(value) && value >= 50 && value <= 2000 ? value : 250;
+})();
+
+function capTranscriptItems(items) {
+  return items.length > MAX_TRANSCRIPT_ITEMS
+    ? items.slice(items.length - MAX_TRANSCRIPT_ITEMS)
+    : items;
+}
 
 const Auth = lazy(() => import('./components/Auth'));
 const Sidebar = lazy(() => import('./components/Sidebar'));
@@ -93,10 +104,25 @@ function VoiceApp({ onResetClient }) {
     awaitingRemoteAudio: false,
   });
   const pendingLatencyRef = React.useRef(null);
+  const sessionTelemetryRef = React.useRef(null);
+  const stopPeerMonitorRef = React.useRef(null);
   
   const [expandedToolCalls, setExpandedToolCalls] = useState({});
   const [liveLatency, setLiveLatency] = useState(null);
   const [isVoiceBusy, setIsVoiceBusy] = useState(false);
+  const [textInput, setTextInput] = useState('');
+  const [isSendingText, setIsSendingText] = useState(false);
+  const [theme, setTheme] = useState(() => {
+    const savedTheme = localStorage.getItem('aura_theme');
+    if (savedTheme === 'light' || savedTheme === 'dark') return savedTheme;
+    return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  });
+
+  React.useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    document.documentElement.style.colorScheme = theme;
+    localStorage.setItem('aura_theme', theme);
+  }, [theme]);
 
   const toggleToolCall = (id) => {
     setExpandedToolCalls(prev => ({...prev, [id]: !prev[id]}));
@@ -170,7 +196,11 @@ function VoiceApp({ onResetClient }) {
 
   React.useEffect(() => {
     if (!shouldAutoScrollRef.current) return;
-    transcriptBottomRef.current?.scrollIntoView({ behavior: 'auto', block: 'end' });
+    const frameId = window.requestAnimationFrame(() => {
+      const area = transcriptAreaRef.current;
+      if (area) area.scrollTo({ top: area.scrollHeight, behavior: 'auto' });
+    });
+    return () => window.cancelAnimationFrame(frameId);
   }, [transcripts]);
 
   const handleTranscriptScroll = useCallback(() => {
@@ -184,6 +214,7 @@ function VoiceApp({ onResetClient }) {
     if (isActive) await disconnect();
     currentConversationIdRef.current = id;
     setCurrentConversationId(id);
+    shouldAutoScrollRef.current = true;
     try {
       const res = await fetchWithAuth(`/api/conversations/${id}/messages`);
       if (res.ok) {
@@ -320,24 +351,27 @@ function VoiceApp({ onResetClient }) {
     currentConversationIdRef.current = null;
     setCurrentConversationId(null);
     setTranscripts([]);
+    setTextInput('');
+    shouldAutoScrollRef.current = true;
     setLiveLatency(null);
   };
 
   const addTranscript = useCallback((role, text, isDelta = false, messageId = null) => {
     if (!text) return;
+    if (role === 'You') shouldAutoScrollRef.current = true;
     
     setTranscripts((items) => {
       const existingIndex = messageId ? items.findIndex(item => item.id === messageId) : -1;
-      if (existingIndex !== -1 && isDelta) {
+      if (existingIndex !== -1) {
         const updated = [...items];
         updated[existingIndex] = {
           ...updated[existingIndex],
-          text: updated[existingIndex].text + text,
+          text: isDelta ? updated[existingIndex].text + text : text,
         };
         return updated;
       }
       
-      return [
+      return capTranscriptItems([
         ...items,
         {
           id: messageId || `${Date.now()}-${items.length}`,
@@ -345,7 +379,44 @@ function VoiceApp({ onResetClient }) {
           text,
           timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
         },
-      ];
+      ]);
+    });
+  }, []);
+
+  const upsertToolCall = useCallback((data) => {
+    const toolCallId = data.tool_call_id || `tool-${Date.now()}`;
+    const previousPayload = toolCallPayloadsRef.current[toolCallId] || {};
+    const payload = {
+      ...previousPayload,
+      tool_call_id: toolCallId,
+      function_name: data.function_name || previousPayload.function_name,
+      arguments: data.arguments || data.args || previousPayload.arguments,
+      result: Object.prototype.hasOwnProperty.call(data, 'result')
+        ? data.result
+        : previousPayload.result,
+      status: data.status || previousPayload.status,
+    };
+    toolCallPayloadsRef.current[toolCallId] = payload;
+
+    setTranscripts((items) => {
+      const existingIdx = items.findIndex((item) => item.id === toolCallId);
+      if (existingIdx !== -1) {
+        const updated = [...items];
+        updated[existingIdx] = {
+          ...updated[existingIdx],
+          text: JSON.stringify(payload),
+        };
+        return updated;
+      }
+      return capTranscriptItems([
+        ...items,
+        {
+          id: toolCallId,
+          role: 'ToolCall',
+          text: JSON.stringify(payload),
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+        },
+      ]);
     });
   }, []);
 
@@ -374,7 +445,7 @@ function VoiceApp({ onResetClient }) {
     }
   }, []);
 
-  const commitClientLatency = useCallback(() => {
+  const commitClientLatency = useCallback(async () => {
     const pending = pendingLatencyRef.current;
     const timing = voiceTurnTimingRef.current;
     if (!pending || timing.firstRemoteAudioAt == null) return;
@@ -405,15 +476,19 @@ function VoiceApp({ onResetClient }) {
         : 'server_turn_stop_event',
     };
 
+    const webrtcMetrics = await collectWebRTCAudioStats(pcClient?.transport).catch(() => null);
     setLiveLatency((current) => (
-      current?.turn_id === pending.turnId ? { ...current, ...clientMetrics } : current
+      current?.turn_id === pending.turnId
+        ? { ...current, ...clientMetrics, ...(webrtcMetrics || {}) }
+        : current
     ));
-    pendingLatencyRef.current = null;
-  }, []);
+    if (pendingLatencyRef.current === pending) pendingLatencyRef.current = null;
+  }, [pcClient]);
 
   useRTVIClientEvent(
     RTVIEvent.TransportStateChanged,
     useCallback((state) => {
+      sessionTelemetryRef.current?.markState('transport', state);
       if (state === 'ready' || state === 'connected' || state === 'error') {
         setIsConnecting(false);
       }
@@ -423,10 +498,22 @@ function VoiceApp({ onResetClient }) {
   useRTVIClientEvent(
     RTVIEvent.TrackStarted,
     useCallback((track, participant) => {
-      if (track?.kind !== 'audio' || !participant?.local || !track.applyConstraints) return;
-      track.applyConstraints(buildAudioConstraints()).catch((constraintError) => {
-        console.warn('Could not apply microphone DSP constraints', constraintError);
-      });
+      if (track?.kind !== 'audio') return;
+      if (participant?.local && track.applyConstraints) {
+        track.applyConstraints(buildAudioConstraints()).catch((constraintError) => {
+          console.warn('Could not apply microphone DSP constraints', constraintError);
+        }).finally(() => {
+          recordCaptureTrack(track, sessionTelemetryRef.current);
+        });
+        return;
+      }
+      if (!participant?.local) {
+        window.setTimeout(() => {
+          ensureBotAudioPlayback().catch((playbackError) => {
+            setError(`Browser blocked bot audio playback: ${playbackError?.message || playbackError}`);
+          });
+        }, 0);
+      }
     }, []),
   );
 
@@ -525,73 +612,15 @@ function VoiceApp({ onResetClient }) {
 
   useRTVIClientEvent(
     RTVIEvent.LLMFunctionCallInProgress,
-    useCallback((data) => {
-      const toolCallId = data.tool_call_id || `tool-${Date.now()}`;
-      const payload = {
-        tool_call_id: toolCallId,
-        function_name: data.function_name,
-        arguments: data.arguments || data.args,
-        result: undefined
-      };
-      toolCallPayloadsRef.current[toolCallId] = payload;
-
-      setTranscripts((items) => {
-        const existingIdx = items.findIndex(i => i.id === toolCallId);
-        if (existingIdx !== -1) {
-          const updated = [...items];
-          updated[existingIdx] = {
-            ...updated[existingIdx],
-            text: JSON.stringify(payload)
-          };
-          return updated;
-        }
-        return [
-          ...items,
-          {
-            id: toolCallId,
-            role: 'ToolCall',
-            text: JSON.stringify(payload),
-            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-          }
-        ];
-      });
-    }, []),
+    useCallback((data) => upsertToolCall({ ...data, status: 'in_progress' }), [upsertToolCall]),
   );
 
   useRTVIClientEvent(
     RTVIEvent.LLMFunctionCallStopped,
-    useCallback((data) => {
-      const toolCallId = data.tool_call_id || `tool-${Date.now()}`;
-      const previousPayload = toolCallPayloadsRef.current[toolCallId] || {};
-      const payloadToSave = {
-        tool_call_id: toolCallId,
-        function_name: data.function_name || previousPayload.function_name,
-        arguments: data.arguments || data.args || previousPayload.arguments,
-        result: data.result
-      };
-      toolCallPayloadsRef.current[toolCallId] = payloadToSave;
-
-      setTranscripts((items) => {
-        const existingIdx = items.findIndex(i => i.id === toolCallId);
-        if (existingIdx !== -1) {
-          const updated = [...items];
-          updated[existingIdx] = {
-            ...updated[existingIdx],
-            text: JSON.stringify(payloadToSave)
-          };
-          return updated;
-        }
-        return [
-          ...items,
-          {
-            id: toolCallId,
-            role: 'ToolCall',
-            text: JSON.stringify(payloadToSave),
-            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-          }
-        ];
-      });
-    }, []),
+    useCallback((data) => upsertToolCall({
+      ...data,
+      status: data.cancelled ? 'cancelled' : 'completed',
+    }), [upsertToolCall]),
   );
 
   useRTVIClientEvent(
@@ -643,13 +672,26 @@ function VoiceApp({ onResetClient }) {
         commitClientLatency();
         return;
       }
+      if (messageData?.type === 'assistant_transcript' && messageData.payload?.text) {
+        addTranscript(
+          'Aura',
+          messageData.payload.text,
+          false,
+          messageData.payload.id || null,
+        );
+        return;
+      }
+      if (messageData?.type === 'tool_call' && messageData.payload) {
+        upsertToolCall(messageData.payload);
+        return;
+      }
       if (messageData?.type !== 'rag_call' || !messageData.payload) return;
       const payload = messageData.payload;
       const ragCallId = payload.rag_call_id || `rag-${Date.now()}`;
 
       setTranscripts((items) => {
         if (items.some((item) => item.id === ragCallId)) return items;
-        return [
+        return capTranscriptItems([
           ...items,
           {
             id: ragCallId,
@@ -657,20 +699,24 @@ function VoiceApp({ onResetClient }) {
             text: JSON.stringify(payload),
             timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
           }
-        ];
+        ]);
       });
-    }, [commitClientLatency, fetchConversations]),
+    }, [addTranscript, commitClientLatency, fetchConversations, upsertToolCall]),
   );
 
   const startConversation = async () => {
-    if (!pcClient || isConnecting || !canStart) return;
+    if (!pcClient || isConnecting || !canStart) return false;
 
     setError('');
     setIsConnecting(true);
     setLiveLatency(null);
+    const telemetry = createSessionTelemetry(START_ENDPOINT);
+    sessionTelemetryRef.current = telemetry;
+    stopPeerMonitorRef.current?.();
+    stopPeerMonitorRef.current = monitorPeerConnection(pcClient.transport, telemetry);
 
     try {
-      await pcClient.startBotAndConnect({
+      const connectPromise = pcClient.startBotAndConnect({
         endpoint: START_ENDPOINT,
         requestData: {
           transport: 'webrtc',
@@ -680,9 +726,42 @@ function VoiceApp({ onResetClient }) {
           },
         },
       });
+      await withConnectionDeadline(
+        connectPromise,
+        webRTCConnectTimeoutMs(),
+        () => pcClient.disconnect(),
+      );
+      telemetry.mark('connect_promise_resolved');
+      await recordSelectedCandidatePair(pcClient.transport, telemetry).catch(() => null);
+      publishSessionTelemetry(telemetry);
+      return true;
     } catch (err) {
+      telemetry.mark('connect_failed');
+      publishSessionTelemetry(telemetry);
       setError(err?.message || 'Could not connect to bot.py');
       setIsConnecting(false);
+      return false;
+    }
+  };
+
+  const sendTextMessage = async (event) => {
+    event.preventDefault();
+    const content = textInput.trim();
+    if (!content || isSendingText || isVoiceBusy || !isActive) return;
+
+    setError('');
+    setIsSendingText(true);
+    shouldAutoScrollRef.current = true;
+    try {
+      await pcClient.sendText(content, {
+        run_immediately: true,
+        audio_response: true,
+      });
+      setTextInput('');
+    } catch (err) {
+      setError(err?.message || 'Could not send message');
+    } finally {
+      setIsSendingText(false);
     }
   };
 
@@ -690,6 +769,8 @@ function VoiceApp({ onResetClient }) {
     setError('');
     setIsConnecting(false);
     setIsVoiceBusy(false);
+    stopPeerMonitorRef.current?.();
+    stopPeerMonitorRef.current = null;
     try {
       await pcClient?.disconnect();
     } finally {
@@ -734,9 +815,19 @@ function VoiceApp({ onResetClient }) {
       <div className="main-stage">
         <div className="main-header">
           <div className="sidebar-title" style={{ margin: 0 }}>New conversation</div>
-          <div className="status-indicator">
-            <div className={`status-dot ${isActive ? 'active' : ''}`} style={isActive ? {backgroundColor: '#10b981'} : {}}></div>
-            {statusLabel}
+          <div className="header-actions">
+            <button
+              className="theme-toggle"
+              onClick={() => setTheme((current) => current === 'dark' ? 'light' : 'dark')}
+              aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}
+              title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}
+            >
+              {theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}
+            </button>
+            <div className="status-indicator">
+              <div className={`status-dot ${isActive ? 'active' : ''}`} style={isActive ? {backgroundColor: '#10b981'} : {}}></div>
+              {statusLabel}
+            </div>
           </div>
         </div>
         
@@ -750,42 +841,43 @@ function VoiceApp({ onResetClient }) {
         />
 
         <div className="voice-controls-area">
-          <div className="voice-visualizer-container">
-            {isActive ? (
-              <VoiceVisualizer
-                participantType="local"
-                barColor="#7c3aed"
-                barCount={24}
-                barGap={4}
-                barWidth={6}
-                barMaxHeight={60}
+          <div className="interaction-row">
+            <form className="text-composer" onSubmit={sendTextMessage}>
+              <textarea
+                value={textInput}
+                onChange={(event) => setTextInput(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' && !event.shiftKey) {
+                    event.preventDefault();
+                    event.currentTarget.form?.requestSubmit();
+                  }
+                }}
+                placeholder={isActive ? 'Message Aura…' : 'Start voice to enable messaging'}
+                aria-label="Message Aura"
+                rows={1}
+                disabled={!isActive || isSendingText}
               />
-            ) : (
-              <div className="wave-placeholder"></div>
-            )}
-          </div>
-          
-          <div className="mic-button-container">
-            <button
-              className={`mic-button ${isActive ? 'active' : ''}`}
-              disabled={isConnecting || !canStart}
-              onClick={startConversation}
-            >
-              <Mic className="mic-icon" strokeWidth={isActive ? 2 : 1.5} />
-            </button>
-            <div className="mic-label">{isActive ? 'Listening' : isConnecting ? 'Connecting...' : 'Click to start'}</div>
-            {error ? <div className="error-message">{error}</div> : null}
-            
-            <div className="call-controls">
               <button
-                className={`control-btn ${isMicEnabled ? '' : 'muted'}`}
-                disabled={!isActive}
-                onClick={() => enableMic(!isMicEnabled)}
-                title={isMicEnabled ? 'Mute microphone' : 'Unmute microphone'}
+                type="submit"
+                className="text-send-button"
+                disabled={!isActive || isVoiceBusy || isSendingText || !textInput.trim()}
+                aria-label="Send message"
+                title="Send message"
               >
-                <Mic size={18} strokeWidth={2} />
+                <Send size={18} strokeWidth={2.2} />
               </button>
-              <button className="control-btn" disabled={!isActive} title="Bot audio is enabled">
+            </form>
+            <button
+              className={`mic-button ${isActive && isMicEnabled ? 'active' : ''} ${isActive && !isMicEnabled ? 'muted' : ''}`}
+              disabled={isConnecting || (!isActive && !canStart)}
+              onClick={() => isActive ? enableMic(!isMicEnabled) : startConversation()}
+              aria-label={isActive ? (isMicEnabled ? 'Mute microphone' : 'Unmute microphone') : 'Start conversation'}
+              title={isActive ? (isMicEnabled ? 'Mute microphone' : 'Unmute microphone') : 'Start conversation'}
+            >
+              <Mic className="mic-icon" strokeWidth={2} />
+            </button>
+            <div className="inline-call-controls">
+              <button className="control-btn" disabled={!isActive} aria-label="Bot audio is enabled" title="Bot audio is enabled">
                 <Volume2 size={18} strokeWidth={2} />
               </button>
               <button
@@ -799,6 +891,7 @@ function VoiceApp({ onResetClient }) {
               </button>
             </div>
           </div>
+          {error ? <div className="error-message">{error}</div> : null}
         </div>
       </div>
       {inspectedFile ? (

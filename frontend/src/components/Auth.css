@@ -103,6 +103,37 @@
   box-shadow: 0 0 0 3px rgba(124, 58, 237, 0.1);
 }
 
+/* Auth fields deliberately remain light in dark mode, so their foreground
+   and caret must not inherit the app-wide dark input color. */
+:root[data-theme='dark'] .input-group input {
+  background-color: #f8fafc;
+  color: #0f172a;
+  caret-color: #7c3aed;
+  border-color: #475569;
+}
+
+:root[data-theme='dark'] .input-group input:focus {
+  background-color: #ffffff;
+  color: #0f172a;
+}
+
+:root[data-theme='dark'] .input-group input::placeholder {
+  color: #64748b;
+  opacity: 1;
+}
+
+:root[data-theme='dark'] .input-group input::selection {
+  background: #ddd6fe;
+  color: #0f172a;
+}
+
+:root[data-theme='dark'] .input-group input:-webkit-autofill,
+:root[data-theme='dark'] .input-group input:-webkit-autofill:hover,
+:root[data-theme='dark'] .input-group input:-webkit-autofill:focus {
+  -webkit-text-fill-color: #0f172a;
+  caret-color: #7c3aed;
+}
+
 .auth-submit {
   display: flex;
   align-items: center;

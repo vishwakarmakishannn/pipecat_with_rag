@@ -34,7 +34,7 @@ async def test_voice_start_creates_missing_conversation(monkeypatch):
     async def no_prior(*_args):
         return None
 
-    monkeypatch.setattr(memory, "AsyncSessionLocal", SessionContext)
+    monkeypatch.setattr(memory, "VoiceSessionLocal", SessionContext)
     monkeypatch.setattr(memory, "authenticate_token", authenticate)
     monkeypatch.setattr(memory, "_load_active_facts", empty)
     monkeypatch.setattr(memory, "_load_recent_messages_in_session", empty)

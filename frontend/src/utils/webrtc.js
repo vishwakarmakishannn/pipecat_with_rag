@@ -47,3 +47,12 @@ export function localSpeechLevelThreshold(env = import.meta.env) {
   }
   return value;
 }
+
+export function webRTCConnectTimeoutMs(env = import.meta.env) {
+  const raw = env?.VITE_WEBRTC_CONNECT_TIMEOUT_MS ?? '8000';
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 1000 || value > 30000) {
+    throw new Error('VITE_WEBRTC_CONNECT_TIMEOUT_MS must be between 1000 and 30000');
+  }
+  return value;
+}

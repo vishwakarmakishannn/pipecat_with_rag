@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+tests/
+test_*.py
+*.bak
+.env
+.env.*
+uploads/
+graphify-out/
+.git/
+.gitignore
+README.md

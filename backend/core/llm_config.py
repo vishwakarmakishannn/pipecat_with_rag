@@ -26,3 +26,7 @@ def timeout_recovery_text() -> str:
     if not value:
         raise ValueError("VOICE_LLM_TIMEOUT_MESSAGE must not be empty")
     return value
+
+
+def total_timeout_seconds() -> float:
+    return _bounded_seconds("VOICE_LLM_TOTAL_TIMEOUT_SECONDS", 20.0, 1.0, 120.0)

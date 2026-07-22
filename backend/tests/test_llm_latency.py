@@ -5,6 +5,7 @@ import pytest
 from loguru import logger
 
 from providers.llm.google_llm import FirstTokenTimeoutError, LatencyBoundGoogleLLMService
+from providers.llm.stream_timeout import LLMStreamDeadlineError, bounded_openai_stream
 
 
 def _chunk(text=None):
@@ -54,6 +55,30 @@ async def test_google_timeout_becomes_spoken_recovery_chunk():
     ]
     assert len(chunks) == 1
     assert chunks[0].candidates[0].content.parts[0].text == "Please try again."
+
+
+@pytest.mark.anyio
+async def test_openai_compatible_stream_has_first_output_deadline():
+    async def stalled():
+        await asyncio.Event().wait()
+        yield None
+
+    with pytest.raises(LLMStreamDeadlineError, match="first output"):
+        async for _ in bounded_openai_stream(stalled(), 0.01, 1):
+            pass
+
+
+@pytest.mark.anyio
+async def test_openai_compatible_stream_has_total_deadline():
+    async def stream():
+        yield SimpleNamespace(
+            choices=[SimpleNamespace(delta=SimpleNamespace(content="hello"))]
+        )
+        await asyncio.Event().wait()
+
+    with pytest.raises(LLMStreamDeadlineError, match="total"):
+        async for _ in bounded_openai_stream(stream(), 0.1, 0.02):
+            pass
 
 
 @pytest.mark.anyio
