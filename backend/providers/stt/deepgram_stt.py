@@ -66,7 +66,16 @@ class ResilientDeepgramSTTService(DeepgramSTTService):
         return value
 
     async def _connect(self):
-        await super()._connect()
+        started = time.monotonic()
+        try:
+            await super()._connect()
+        except BaseException:
+            logger.warning(
+                "voice_startup stage=provider_connected service=deepgram_stt "
+                "status=failed duration_ms={}",
+                round((time.monotonic() - started) * 1000, 1),
+            )
+            raise
         try:
             await asyncio.wait_for(
                 self._connection_ready.wait(),
@@ -81,6 +90,11 @@ class ResilientDeepgramSTTService(DeepgramSTTService):
             self._connection = None
             self._connection_ready.clear()
             raise
+        logger.info(
+            "voice_startup stage=provider_connected service=deepgram_stt "
+            "status=ready duration_ms={}",
+            round((time.monotonic() - started) * 1000, 1),
+        )
 
     async def _reset_stt_ttfb_state(self):
         """Cancel abandoned-turn timing without emitting a stale TTFB sample."""

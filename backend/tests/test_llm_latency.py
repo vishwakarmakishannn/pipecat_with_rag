@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 from loguru import logger
+from pipecat.services.google.llm import GoogleLLMService
 
 from providers.llm.google_llm import FirstTokenTimeoutError, LatencyBoundGoogleLLMService
 from providers.llm.stream_timeout import LLMStreamDeadlineError, bounded_openai_stream
@@ -53,6 +54,24 @@ async def test_google_timeout_becomes_spoken_recovery_chunk():
             stalled_stream(), 0.01, "Please try again."
         )
     ]
+    assert len(chunks) == 1
+    assert chunks[0].candidates[0].content.parts[0].text == "Please try again."
+
+
+@pytest.mark.anyio
+async def test_google_stream_creation_is_inside_first_token_deadline(monkeypatch):
+    async def stalled_stream_creation(_self, _context):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(GoogleLLMService, "_stream_content", stalled_stream_creation)
+    service = object.__new__(LatencyBoundGoogleLLMService)
+    service._first_token_timeout_secs = 0.01
+    service._timeout_message = "Please try again."
+    service._settings = SimpleNamespace(model="test-model")
+
+    stream = await service._stream_content(None)
+    chunks = [chunk async for chunk in stream]
+
     assert len(chunks) == 1
     assert chunks[0].candidates[0].content.parts[0].text == "Please try again."
 

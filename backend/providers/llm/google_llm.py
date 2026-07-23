@@ -97,8 +97,9 @@ class LatencyBoundGoogleLLMService(GoogleLLMService):
         *,
         request_id: str = "unknown",
         provider_model: str = "google",
+        started_at: float | None = None,
     ):
-        started = time.monotonic()
+        started = time.monotonic() if started_at is None else started_at
         first_chunk_seen = False
         try:
             async for chunk in cls._first_output_stream(stream, timeout_secs):
@@ -124,10 +125,18 @@ class LatencyBoundGoogleLLMService(GoogleLLMService):
             )
             yield cls._text_chunk(timeout_message)
 
+    @classmethod
+    async def _recovery_stream(
+        cls,
+        timeout_message: str,
+    ):
+        """Return a valid stream when request creation itself times out."""
+        yield cls._text_chunk(timeout_message)
+
     async def _stream_content(self, context):
         request_id = uuid.uuid4().hex
         provider_model = self._settings.model
-        stream = await super()._stream_content(context)
+        started = time.monotonic()
         logger.info(
             "voice_llm request_id={} provider=google model={} status=started "
             "deadline_ms={}",
@@ -135,12 +144,31 @@ class LatencyBoundGoogleLLMService(GoogleLLMService):
             provider_model,
             round(self._first_token_timeout_secs * 1000),
         )
+        try:
+            stream = await asyncio.wait_for(
+                super()._stream_content(context),
+                timeout=self._first_token_timeout_secs,
+            )
+        except TimeoutError:
+            logger.warning(
+                "voice_llm request_id={} provider=google model={} status=stream_creation_timeout "
+                "latency_ms={} budget_ms={} action=spoken_recovery",
+                request_id,
+                provider_model,
+                round((time.monotonic() - started) * 1000, 1),
+                round(self._first_token_timeout_secs * 1000),
+            )
+            return self._recovery_stream(self._timeout_message)
+
+        elapsed = time.monotonic() - started
+        remaining = max(0.001, self._first_token_timeout_secs - elapsed)
         return self._recovering_stream(
             stream,
-            self._first_token_timeout_secs,
+            remaining,
             self._timeout_message,
             request_id=request_id,
             provider_model=provider_model,
+            started_at=started,
         )
 
 

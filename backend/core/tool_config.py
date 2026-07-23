@@ -2,7 +2,7 @@ import os
 
 
 def tool_timeout_seconds() -> float:
-    raw = os.getenv("VOICE_TOOL_TIMEOUT_SECONDS", "5")
+    raw = os.getenv("VOICE_TOOL_TIMEOUT_SECONDS", "3")
     try:
         value = float(raw)
     except ValueError as exc:
@@ -26,7 +26,7 @@ def _specific_timeout(name: str, default: float) -> float:
 
 
 def web_search_timeout_seconds() -> float:
-    return _specific_timeout("VOICE_WEB_SEARCH_TIMEOUT_SECONDS", 2.0)
+    return _specific_timeout("VOICE_WEB_SEARCH_TIMEOUT_SECONDS", 1.5)
 
 
 def issue_tool_timeout_seconds() -> float:
@@ -37,7 +37,7 @@ def tool_filler_delay_seconds() -> float:
     # Do not start a second TTS context for retrievals that finish almost
     # immediately. Deepgram serializes audio contexts, so an eager filler can
     # otherwise block (and audibly collide with) the real LLM response.
-    raw = os.getenv("VOICE_TOOL_FILLER_DELAY_MS", "500")
+    raw = os.getenv("VOICE_TOOL_FILLER_DELAY_MS", "400")
     try:
         value_ms = float(raw)
     except ValueError as exc:

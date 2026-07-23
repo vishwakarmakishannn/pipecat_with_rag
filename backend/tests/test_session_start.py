@@ -17,6 +17,9 @@ async def test_voice_start_creates_missing_conversation(monkeypatch):
         async def refresh(self, conversation):
             conversation.id = 123
 
+        async def execute(self, _statement):
+            return SimpleNamespace(scalar_one_or_none=lambda: None)
+
     class SessionContext:
         async def __aenter__(self):
             self.session = Session()

@@ -43,6 +43,7 @@ from core.rag_config import (
     RAG_MIN_FINAL_SCORE,
     RAG_MIN_VECTOR_SIMILARITY,
     RAG_RETRIEVAL_TOP_K,
+    RAG_READY_CORPUS_CACHE_TTL_SECONDS,
     RAG_RRF_K,
     RAG_RERANKER,
     RAG_RERANK_EXACT_METADATA_BOOST,
@@ -70,6 +71,7 @@ _RAG_RESULT_CACHE_TTL_SECONDS = float(os.getenv("RAG_RESULT_CACHE_TTL_SECONDS", 
 _rag_corpus_versions: dict[int, int] = defaultdict(int)
 _rag_result_cache: OrderedDict[tuple, tuple[float, tuple]] = OrderedDict()
 _rag_result_inflight: dict[tuple, asyncio.Task] = {}
+_rag_ready_corpus_cache: dict[int, tuple[float, int, bool]] = {}
 _EMBEDDING_UNSET = object()
 
 
@@ -79,6 +81,7 @@ def _normalized_cache_query(query: str) -> str:
 
 def bump_rag_corpus_version(user_id: int) -> None:
     _rag_corpus_versions[user_id] += 1
+    _rag_ready_corpus_cache.pop(user_id, None)
     for key in [key for key in _rag_result_cache if key[0] == user_id]:
         _rag_result_cache.pop(key, None)
 
@@ -87,6 +90,39 @@ def clear_rag_result_cache() -> None:
     _rag_result_cache.clear()
     _rag_result_inflight.clear()
     _rag_corpus_versions.clear()
+    _rag_ready_corpus_cache.clear()
+
+
+def prime_rag_corpus_status(user_id: int, has_ready_corpus: bool) -> None:
+    """Prime the session-critical corpus check from authentication I/O."""
+    _rag_ready_corpus_cache[user_id] = (
+        time.monotonic(),
+        _rag_corpus_versions[user_id],
+        has_ready_corpus,
+    )
+
+
+async def user_has_ready_rag_corpus(user_id: int) -> bool:
+    """Return ready-corpus presence without embedding or chunk retrieval."""
+    now = time.monotonic()
+    version = _rag_corpus_versions[user_id]
+    cached = _rag_ready_corpus_cache.get(user_id)
+    if (
+        cached
+        and cached[1] == version
+        and now - cached[0] <= RAG_READY_CORPUS_CACHE_TTL_SECONDS
+    ):
+        return cached[2]
+
+    async with VoiceSessionLocal() as db:
+        result = await db.execute(
+            select(RagFile.id)
+            .where(RagFile.user_id == user_id, RagFile.status == "ready")
+            .limit(1)
+        )
+        has_ready_corpus = result.scalar_one_or_none() is not None
+    prime_rag_corpus_status(user_id, has_ready_corpus)
+    return has_ready_corpus
 
 
 @dataclass
@@ -132,14 +168,29 @@ def is_rag_query(query: str) -> bool:
     return any(re.search(pattern, normalized) for pattern in RAG_QUERY_PATTERNS)
 
 
-def should_attempt_rag_retrieval(query: str) -> bool:
-    """Attempt retrieval from query shape, not a brittle list of source phrases.
-
-    Evidence gating later decides whether corpus content is relevant enough to
-    inject. This lets users refer to saved material in unanticipated language.
-    """
+def should_attempt_rag_retrieval(query: str, mode: str | None = None) -> bool:
+    """Route retrieval according to an explicit latency/recall policy."""
     normalized = re.sub(r"\s+", " ", (query or "").strip())
-    return len(normalized) >= 3 and bool(re.search(r"[\w\d]", normalized, re.UNICODE))
+    if len(normalized) < 3 or not re.search(r"[\w\d]", normalized, re.UNICODE):
+        return False
+    selected_mode = RAG_SMART_ROUTER if mode is None else mode.strip().lower()
+    if selected_mode == "explicit":
+        return is_rag_query(normalized)
+    if selected_mode == "hybrid":
+        # Hybrid preserves semantic discovery for users who prefer recall over
+        # the lowest direct-turn latency. Evidence gating still decides whether
+        # retrieved chunks enter the model context.
+        return is_rag_query(normalized) or bool(
+            re.search(
+                r"\b(what|which|who|when|where|why|how|explain|describe|"
+                r"summarize|compare|find|tell me)\b",
+                normalized,
+                re.IGNORECASE,
+            )
+        )
+    if selected_mode == "always":
+        return True
+    raise ValueError(f"Unsupported RAG routing mode: {selected_mode!r}")
 
 
 # rag_storage_path and rag_link_storage_path removed as they are now handled by core.storage

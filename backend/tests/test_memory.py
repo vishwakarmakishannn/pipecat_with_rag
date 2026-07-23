@@ -372,3 +372,29 @@ async def test_embed_text_deduplicates_concurrent_requests(monkeypatch):
 
     assert calls == 1
     assert first == second == third
+
+
+@pytest.mark.anyio
+async def test_disabled_embedding_provider_never_calls_remote_provider(monkeypatch):
+    calls = 0
+
+    async def fake_embed(*_args):
+        nonlocal calls
+        calls += 1
+        return [0.25] * memory_service.MEMORY_EMBEDDING_DIMENSION
+
+    monkeypatch.setattr(memory_service, "_embed_uncached", fake_embed)
+    monkeypatch.setattr(memory_service, "MEMORY_VECTOR_DB", "pgvector")
+    monkeypatch.setenv("MEMORY_EMBEDDING_PROVIDER", "disabled")
+
+    assert await memory_service.embed_text("do not send this") is None
+    assert calls == 0
+
+
+def test_embedding_provider_rejects_fake_local_fallback(monkeypatch):
+    from core.memory_config import memory_embedding_provider
+
+    monkeypatch.setenv("MEMORY_EMBEDDING_PROVIDER", "local")
+
+    with pytest.raises(ValueError, match="google, openai, or disabled"):
+        memory_embedding_provider()

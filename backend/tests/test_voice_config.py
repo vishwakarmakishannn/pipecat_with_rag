@@ -17,8 +17,8 @@ def test_endpointing_defaults_are_low_latency(monkeypatch):
 
     config = load_endpointing_config()
 
-    assert config.vad_stop_secs == 0.15
-    assert config.smart_turn_stop_secs == 0.6
+    assert config.vad_stop_secs == 0.20
+    assert config.smart_turn_stop_secs == 0.3
 
 
 def test_endpointing_rejects_invalid_values(monkeypatch):

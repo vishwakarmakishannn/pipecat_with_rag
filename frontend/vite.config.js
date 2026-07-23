@@ -3,6 +3,9 @@ import react from '@vitejs/plugin-react'
 
 // https://vite.dev/config/
 export default defineConfig({
+  // Keep one project-level environment file. Vite still exposes only VITE_*
+  // variables to browser code, so backend credentials remain private.
+  envDir: '..',
   plugins: [react()],
   build: {
     rollupOptions: {

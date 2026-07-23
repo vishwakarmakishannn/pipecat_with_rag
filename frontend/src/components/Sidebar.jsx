@@ -42,7 +42,9 @@ export default function Sidebar({
     return value < 1000 ? `${Math.round(value)} ms` : `${(value / 1000).toFixed(2)} s`;
   };
 
-  const primaryLatency = (item) => item.user_stop_to_playback_ms ?? item.answer_audio_ms;
+  const primaryLatency = (item) => (
+    item.text_send_to_playback_ms ?? item.user_stop_to_playback_ms ?? item.answer_audio_ms
+  );
 
   const formatFileSize = (sizeBytes) => {
     if (!sizeBytes) return '0 KB';
@@ -261,7 +263,9 @@ export default function Sidebar({
             <strong>{formatLatency(liveLatency ? primaryLatency(liveLatency) : null)}</strong>
           </div>
           <div className="latency-footnote">
-            {liveLatency?.user_stop_to_playback_ms != null
+            {liveLatency?.text_send_to_playback_ms != null
+              ? 'Text sent → first decoded playback audio'
+              : liveLatency?.user_stop_to_playback_ms != null
               ? liveLatency.speech_end_signal === 'last_nonzero_local_audio_level'
                 ? `Last local speech → decoded audio${liveLatency.endpointing_ms != null ? ` · endpoint ${formatLatency(liveLatency.endpointing_ms)}` : ''}`
                 : 'Turn-stop signal → first decoded playback audio'

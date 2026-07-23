@@ -1,4 +1,4 @@
-FROM python:3.12-slim AS builder
+FROM python:3.14-slim AS builder
 
 WORKDIR /app
 
@@ -25,7 +25,7 @@ COPY . .
 # Install the actual project using uv
 RUN uv sync --frozen --no-dev
 
-FROM python:3.12-slim AS runtime
+FROM python:3.14-slim AS runtime
 
 WORKDIR /app
 
@@ -44,4 +44,6 @@ COPY --from=builder /app /app
 # Schema migration is an explicit deployment job (the Compose `migrate`
 # service), so application replicas can start concurrently without contending
 # on Alembic locks.
-CMD ["python", "main.py"]
+# Containers must listen on every interface so sibling services (the frontend
+# reverse proxy) can reach the API over the Compose network.
+CMD ["python", "main.py", "--host", "0.0.0.0"]

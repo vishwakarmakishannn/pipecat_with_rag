@@ -132,3 +132,108 @@ def test_groq_builder_does_not_treat_temperature_as_latency_control(monkeypatch)
     groq_llm.get_groq_llm()
 
     assert "temperature" not in captured["settings"].values
+
+
+def test_groq_builder_sends_completion_controls_through_settings_extra(monkeypatch):
+    from providers.llm import groq_llm
+
+    captured = {}
+
+    class FakeSettings:
+        def __init__(self, **kwargs):
+            self.values = kwargs
+
+    class FakeGroqService:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(groq_llm, "GroqLLMSettings", FakeSettings)
+    monkeypatch.setattr(groq_llm, "LatencyBoundGroqLLMService", FakeGroqService)
+    monkeypatch.setattr(groq_llm, "load_system_prompt", lambda: "system prompt")
+    monkeypatch.setenv("GROQ_API_KEY", "groq-key")
+    monkeypatch.setenv("GROQ_MODEL", "openai/gpt-oss-20b")
+    monkeypatch.setenv("GROQ_REASONING_EFFORT", "low")
+    monkeypatch.setenv("GROQ_INCLUDE_REASONING", "false")
+    monkeypatch.setenv("GROQ_PARALLEL_TOOL_CALLS", "false")
+
+    groq_llm.get_groq_llm()
+
+    assert captured["settings"].values["extra"] == {
+        "parallel_tool_calls": False,
+        "reasoning_effort": "low",
+        "include_reasoning": False,
+    }
+    assert "client_kwargs" not in captured
+
+
+def test_groq_builder_omits_reasoning_controls_for_non_reasoning_model(monkeypatch):
+    from providers.llm import groq_llm
+
+    captured = {}
+
+    class FakeSettings:
+        def __init__(self, **kwargs):
+            self.values = kwargs
+
+    class FakeGroqService:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(groq_llm, "GroqLLMSettings", FakeSettings)
+    monkeypatch.setattr(groq_llm, "LatencyBoundGroqLLMService", FakeGroqService)
+    monkeypatch.setattr(groq_llm, "load_system_prompt", lambda: "system prompt")
+    monkeypatch.setenv("GROQ_API_KEY", "groq-key")
+    monkeypatch.setenv("GROQ_MODEL", "llama-3.1-8b-instant")
+    monkeypatch.setenv("GROQ_REASONING_EFFORT", "invalid-for-this-model")
+
+    groq_llm.get_groq_llm()
+
+    assert captured["settings"].values["extra"] == {
+        "parallel_tool_calls": False,
+    }
+
+
+def test_groq_builder_validates_gpt_oss_reasoning_effort(monkeypatch):
+    from providers.llm import groq_llm
+
+    monkeypatch.setenv("GROQ_MODEL", "openai/gpt-oss-20b")
+    monkeypatch.setenv("GROQ_REASONING_EFFORT", "minimal")
+
+    with pytest.raises(ValueError, match="GROQ_REASONING_EFFORT"):
+        groq_llm.get_groq_llm()
+
+
+@pytest.mark.anyio
+async def test_groq_connection_warmup_uses_existing_client_and_fails_open():
+    from providers.llm.groq_llm import LatencyBoundGroqLLMService
+
+    class Models:
+        def __init__(self):
+            self.calls = 0
+
+        async def list(self):
+            self.calls += 1
+            return []
+
+    models = Models()
+    service = object.__new__(LatencyBoundGroqLLMService)
+    service._client = SimpleNamespace(models=models)
+    service._settings = SimpleNamespace(model="llama-3.1-8b-instant")
+    service._connection_warmed = False
+    service._warmup_attempted = False
+
+    assert await service.warm_connection(timeout_seconds=0.2) is True
+    assert await service.warm_connection(timeout_seconds=0.2) is True
+    assert models.calls == 1
+
+    async def fail():
+        raise OSError("network unavailable")
+
+    cold = object.__new__(LatencyBoundGroqLLMService)
+    cold._client = SimpleNamespace(models=SimpleNamespace(list=fail))
+    cold._settings = SimpleNamespace(model="llama-3.1-8b-instant")
+    cold._connection_warmed = False
+    cold._warmup_attempted = False
+
+    assert await cold.warm_connection(timeout_seconds=0.2) is False
+    assert cold.connection_warmed is False

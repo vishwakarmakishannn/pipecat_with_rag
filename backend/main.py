@@ -58,7 +58,12 @@ from pipecat.workers.runner import WorkerRunner
 from pipecat.turns.user_turn_strategies import UserTurnStrategies, TurnAnalyzerUserTurnStopStrategy
 from services.memory import build_memory_messages, build_turn_memory_context, hydrate_memory_bundle, load_session_bundle, save_conversation_message
 from core.memory_config import MEMORY_EMBEDDING_DIMENSION
-from services.rag import build_rag_context_with_payload, is_rag_query
+from services.rag import (
+    build_rag_context_with_payload,
+    is_rag_query,
+    prime_rag_corpus_status,
+    user_has_ready_rag_corpus,
+)
 from core.rag_config import RAG_VOICE_QUERY_WINDOW_SECONDS
 from core.voice_config import load_endpointing_config, startup_greeting
 from core.voice_services import initialize_voice_runtime
@@ -109,6 +114,15 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         get_stt, get_tts, get_llm,
         load_session_bundle, runner_args.body,
     )
+    # Warm OpenAI-compatible provider networking while the rest of the
+    # session pipeline is assembled. This uses the same client instance that
+    # will serve the first turn and fails open inside the provider.
+    llm_warmup_task = None
+    warm_connection = getattr(llm, "warm_connection", None)
+    if callable(warm_connection):
+        llm_warmup_task = asyncio.create_task(
+            warm_connection(), name="voice-llm-connection-warmup"
+        )
     memory_messages = build_memory_messages(memory_bundle)
     if memory_bundle:
         logger.info(
@@ -118,6 +132,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         )
     conversation_id = memory_bundle.conversation.id if memory_bundle else None
     user_id = memory_bundle.user.id if memory_bundle else None
+    if memory_bundle:
+        prime_rag_corpus_status(user_id, memory_bundle.has_ready_rag_corpus)
     assistant_memory = ConversationMemoryProcessor(
         conversation_id,
         capture="assistant",
@@ -157,13 +173,23 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         logger.info("Installed {} asynchronously hydrated memory messages", len(hydrated_messages))
 
     memory_hydration_task = asyncio.create_task(install_optional_memory())
-    latency_state = TurnLatencyState(session_id=getattr(runner_args, "session_id", None))
+    latency_state = TurnLatencyState(
+        session_id=getattr(runner_args, "session_id", None),
+        llm_provider=os.getenv("LLM_PROVIDER", "google").strip().lower(),
+        llm_model=getattr(getattr(llm, "_settings", None), "model", None),
+        tts_provider=os.getenv("TTS_PROVIDER", "cartesia").strip().lower(),
+        tts_model=getattr(getattr(tts, "_settings", None), "model", None),
+        llm_warm_state_getter=lambda: bool(
+            getattr(llm, "connection_warmed", False)
+        ),
+    )
     context_retrieval = ContextRetrievalProcessor(
         user_id,
         conversation_id,
         context,
         latency_state,
         web_search=run_web_search,
+        ready_corpus_check=user_has_ready_rag_corpus,
         name="ContextRetrieval",
     )
     tool_router = ToolRoutingProcessor(
@@ -314,13 +340,24 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     runner = WorkerRunner(handle_sigint=False)
 
     try:
+        if llm_warmup_task:
+            await llm_warmup_task
+            latency_state.llm_connection_warmed = bool(
+                getattr(llm, "connection_warmed", False)
+            )
         await runner.add_workers(worker)
         await runner.run()
     finally:
         realtime_turn_gate.end(latency_state.priority_key)
+        if llm_warmup_task and not llm_warmup_task.done():
+            llm_warmup_task.cancel()
         if not memory_hydration_task.done():
             memory_hydration_task.cancel()
-        await asyncio.gather(memory_hydration_task, return_exceptions=True)
+        await asyncio.gather(
+            memory_hydration_task,
+            *(tuple([llm_warmup_task]) if llm_warmup_task else ()),
+            return_exceptions=True,
+        )
 
 
 async def bot(runner_args: RunnerArguments):
@@ -441,11 +478,13 @@ if __name__ == "__main__":
     from api.history import router as history_router
     from api.memories import router as memories_router
     from api.rag_files import router as rag_files_router
+    from api.telemetry import router as telemetry_router
     
     app.include_router(auth_router)
     app.include_router(history_router)
     app.include_router(memories_router)
     app.include_router(rag_files_router)
+    app.include_router(telemetry_router)
     app.include_router(health_router)
     
     from contextlib import asynccontextmanager

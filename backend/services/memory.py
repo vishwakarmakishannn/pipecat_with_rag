@@ -32,11 +32,12 @@ from core.memory_config import (
     MEMORY_RECALL_MIN_SCORE,
     MEMORY_RECALL_TOP_K,
     MEMORY_VECTOR_DB,
+    memory_embedding_provider,
     PRIOR_CONVERSATION_MESSAGE_LIMIT,
     RECENT_MESSAGE_LIMIT,
     SUMMARY_MESSAGE_THRESHOLD,
 )
-from core.models import Conversation, MemoryChunk, Message, User, UserMemory
+from core.models import Conversation, MemoryChunk, Message, RagFile, User, UserMemory
 from core.prompt_config import load_memory_prompt
 
 
@@ -116,6 +117,7 @@ class MemoryBundle:
     primary_recent_messages: list[Message]
     prior_conversation: Conversation | None = None
     prior_recent_messages: list[Message] | None = None
+    has_ready_rag_corpus: bool = False
 
     @property
     def conversation(self) -> Conversation:
@@ -259,6 +261,12 @@ async def load_session_bundle(body: Any) -> MemoryBundle | None:
             user, conversation = authenticated
 
         user_id = user.id
+        ready_rag_result = await db.execute(
+            select(RagFile.id)
+            .where(RagFile.user_id == user_id, RagFile.status == "ready")
+            .limit(1)
+        )
+        has_ready_rag_corpus = ready_rag_result.scalar_one_or_none() is not None
 
     return MemoryBundle(
         user=user,
@@ -268,6 +276,7 @@ async def load_session_bundle(body: Any) -> MemoryBundle | None:
         primary_recent_messages=[],
         prior_conversation=None,
         prior_recent_messages=None,
+        has_ready_rag_corpus=has_ready_rag_corpus,
     )
 
 
@@ -287,6 +296,7 @@ async def hydrate_memory_bundle(
         primary_recent_messages=recent_messages,
         prior_conversation=bundle.prior_conversation,
         prior_recent_messages=bundle.prior_recent_messages,
+        has_ready_rag_corpus=bundle.has_ready_rag_corpus,
     )
 
 
@@ -572,16 +582,23 @@ async def _embed_uncached(value: str, provider: str) -> list[float] | None:
         response = await client.embeddings.create(input=value, model=model)
         return normalize_embedding(response.data[0].embedding, "OpenAI")
 
-    generators = [embed_google, embed_openai]
-    if provider != "google":
-        generators.reverse()
-
-    for generator in generators:
-        try:
-            return await asyncio.wait_for(generator(), timeout=MEMORY_LLM_TIMEOUT_SECONDS * 5)
-        except Exception as exc:
-            logger.warning(f"Embedding call failed: {exc}")
-    return None
+    if provider == "disabled":
+        return None
+    generator = {
+        "google": embed_google,
+        "openai": embed_openai,
+    }.get(provider)
+    if generator is None:
+        raise ValueError(f"Unsupported memory embedding provider: {provider!r}")
+    try:
+        return await asyncio.wait_for(
+            generator(), timeout=MEMORY_LLM_TIMEOUT_SECONDS * 5
+        )
+    except Exception as exc:
+        # Never cross-fallback to another paid provider. The selected provider
+        # owns its availability, quota, and latency policy.
+        logger.warning("{} embedding call failed: {}", provider, exc)
+        return None
 
 
 async def embed_text(value: str) -> list[float] | None:
@@ -589,7 +606,9 @@ async def embed_text(value: str) -> list[float] | None:
     if not value or MEMORY_VECTOR_DB != "pgvector":
         return None
 
-    provider = os.getenv("MEMORY_EMBEDDING_PROVIDER", "google").lower()
+    provider = memory_embedding_provider()
+    if provider == "disabled":
+        return None
     model = (
         os.getenv("GOOGLE_EMBEDDING_MODEL", "gemini-embedding-001")
         if provider == "google"

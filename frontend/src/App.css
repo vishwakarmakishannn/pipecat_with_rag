@@ -1122,6 +1122,27 @@
   border-color: var(--border-color);
 }
 
+:root[data-theme='dark'] .mic-button.active {
+  background: var(--primary);
+  color: #ffffff;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 4px rgba(167, 139, 250, 0.18), 0 8px 24px rgba(124, 58, 237, 0.28);
+}
+
+:root[data-theme='dark'] .mic-button.active .mic-icon {
+  color: #ffffff;
+}
+
+:root[data-theme='dark'] .mic-button.muted {
+  background: rgba(248, 113, 113, 0.12);
+  color: #fca5a5;
+  border-color: rgba(248, 113, 113, 0.55);
+}
+
+:root[data-theme='dark'] .mic-button.muted .mic-icon {
+  color: #fca5a5;
+}
+
 :root[data-theme='dark'] .sidebar-tab,
 :root[data-theme='dark'] .history-item,
 :root[data-theme='dark'] .tool-call-header,

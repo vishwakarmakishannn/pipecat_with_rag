@@ -2,8 +2,23 @@ import pytest
 import asyncio
 from types import SimpleNamespace
 
-from core.processors import ContextRetrievalProcessor, LatencyBoundaryProcessor, ToolRoutingProcessor, TurnLatencyState
-from pipecat.frames.frames import LLMContextFrame, LLMTextFrame, OutputTransportMessageFrame, TranscriptionFrame, TTSAudioRawFrame, TTSSpeakFrame
+from core.processors import (
+    ContextRetrievalProcessor,
+    LatencyBoundaryProcessor,
+    ToolRoutingProcessor,
+    TurnContextCleanupProcessor,
+    TurnLatencyState,
+)
+from pipecat.frames.frames import (
+    LLMContextFrame,
+    LLMFullResponseEndFrame,
+    LLMTextFrame,
+    OutputTransportMessageFrame,
+    TranscriptionFrame,
+    TTSAudioRawFrame,
+    TTSSpeakFrame,
+    TTSStoppedFrame,
+)
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.processors.aggregators.llm_context import LLMContext
 from services.rag import (
@@ -114,15 +129,59 @@ def test_is_rag_query_ignores_general_chat():
     assert not is_rag_query("What did we talk about previously?")
 
 
-def test_pre_router_bypasses_conversation_but_keeps_information_queries():
+def test_pre_router_explicit_mode_bypasses_general_chat():
     assert not should_attempt_rag_retrieval("")
     assert not should_attempt_rag_retrieval("?")
-    assert should_attempt_rag_retrieval("Okay, thank you")
-    assert should_attempt_rag_retrieval("What is your name?")
-    assert should_attempt_rag_retrieval("Explain what AI is")
+    assert not should_attempt_rag_retrieval("Okay, thank you", mode="explicit")
+    assert not should_attempt_rag_retrieval("What is your name?", mode="explicit")
+    assert not should_attempt_rag_retrieval("Explain what AI is", mode="explicit")
     assert should_attempt_rag_retrieval("What is the device ID of Rohan Sharma in my PDF?")
     assert should_attempt_rag_retrieval("I mean, according to my documents.")
     assert should_attempt_rag_retrieval("Use my saved link for the answer")
+    assert should_attempt_rag_retrieval("What is your name?", mode="hybrid")
+    assert should_attempt_rag_retrieval("Okay, thank you", mode="always")
+
+
+@pytest.mark.anyio
+async def test_ready_corpus_gate_bypasses_rag_before_embedding(monkeypatch):
+    context = LLMContext(
+        messages=[{"role": "user", "content": "What does my document say?"}]
+    )
+    latency_state = TurnLatencyState(session_id="test")
+    retrieval_called = False
+
+    async def no_ready_corpus(_user_id):
+        return False
+
+    async def forbidden_retrieval(*_args, **_kwargs):
+        nonlocal retrieval_called
+        retrieval_called = True
+        raise AssertionError("RAG retrieval should have been bypassed")
+
+    processor = ContextRetrievalProcessor(
+        1,
+        1,
+        context,
+        latency_state,
+        ready_corpus_check=no_ready_corpus,
+    )
+    delivered = []
+
+    async def capture(frame, _direction):
+        delivered.append(frame)
+
+    monkeypatch.setattr(
+        "core.processors.build_rag_context_with_payload", forbidden_retrieval
+    )
+    monkeypatch.setattr(processor, "push_frame", capture)
+    frame = LLMContextFrame(context)
+
+    await processor.process_frame(frame, FrameDirection.DOWNSTREAM)
+
+    assert delivered == [frame]
+    assert retrieval_called is False
+    assert latency_state.rag_considered is True
+    assert latency_state.rag_bypassed is True
 
 
 def test_retrieval_deadline_is_derived_from_concurrent_route_branches(monkeypatch):
@@ -382,6 +441,22 @@ def test_latency_state_counts_transcript_fragments_as_one_active_turn():
     assert state.turn_id == 2
 
 
+def test_latency_state_starts_fresh_text_turn_after_previous_audio(monkeypatch):
+    state = TurnLatencyState(session_id="test")
+    state.start_turn()
+    state.first_audio_seen = True
+    state.final_stt_at = 10.0
+    monkeypatch.setattr("core.processors.time.monotonic", lambda: 20.0)
+
+    state.start_turn()
+
+    assert state.turn_id == 2
+    assert state.started_at == 20.0
+    assert state.final_stt_at == 20.0
+    assert state.speech_stopped_at is None
+    assert state.first_audio_seen is False
+
+
 def test_latency_state_uses_latest_final_fragment_for_completed_turn():
     state = TurnLatencyState(session_id="test")
     state.mark_user_started()
@@ -502,6 +577,8 @@ async def test_answer_audio_uses_turn_release_not_final_stt_as_origin(monkeypatc
     state.audio_speech_stopped_at = 9.0
     state.active = True
     state.first_llm_seen = True
+    state.stage_times["first_speakable_text"] = 18.0
+    state.stage_times["tts_request_started"] = 19.0
     boundary = LatencyBoundaryProcessor(state, "tts")
     delivered = []
 
@@ -518,6 +595,56 @@ async def test_answer_audio_uses_turn_release_not_final_stt_as_origin(monkeypatc
     payload = delivered[1].message["data"]["payload"]
     assert payload["answer_audio_ms"] == 11000.0
     assert payload["final_stt_to_audio_ms"] == 8000.0
+    assert payload["tts_aggregation_ms"] == 1000.0
+    assert payload["tts_provider_ms"] == 1000.0
+    assert payload["speakable_to_audio_ms"] == 2000.0
+
+
+@pytest.mark.anyio
+async def test_llm_completion_keeps_realtime_gate_until_first_audio(monkeypatch):
+    from core.realtime_gate import realtime_turn_gate
+
+    baseline = realtime_turn_gate.active
+    state = TurnLatencyState(session_id="gate-test")
+    state.start_turn()
+    state.first_llm_seen = True
+    retrieval = ContextRetrievalProcessor(1, 1, LLMContext(messages=[]))
+    cleanup = TurnContextCleanupProcessor(retrieval, state)
+    tts_boundary = LatencyBoundaryProcessor(state, "tts")
+
+    async def discard(_frame, _direction):
+        return None
+
+    monkeypatch.setattr(cleanup, "push_frame", discard)
+    monkeypatch.setattr(tts_boundary, "push_frame", discard)
+
+    await cleanup.process_frame(LLMFullResponseEndFrame(), FrameDirection.DOWNSTREAM)
+    assert realtime_turn_gate.active == baseline + 1
+
+    await tts_boundary.process_frame(
+        TTSAudioRawFrame(b"\x01\x00", 24000, 1),
+        FrameDirection.DOWNSTREAM,
+    )
+    assert realtime_turn_gate.active == baseline
+
+
+@pytest.mark.anyio
+async def test_no_audio_tts_stop_releases_realtime_gate(monkeypatch):
+    from core.realtime_gate import realtime_turn_gate
+
+    baseline = realtime_turn_gate.active
+    state = TurnLatencyState(session_id="no-audio")
+    state.start_turn()
+    state.first_llm_seen = True
+    boundary = LatencyBoundaryProcessor(state, "tts")
+
+    async def discard(_frame, _direction):
+        return None
+
+    monkeypatch.setattr(boundary, "push_frame", discard)
+    await boundary.process_frame(TTSStoppedFrame(), FrameDirection.DOWNSTREAM)
+
+    assert realtime_turn_gate.active == baseline
 
 
 def test_vad_endpoint_backdates_confirmation_window(monkeypatch):

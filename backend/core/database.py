@@ -22,7 +22,7 @@ engine = create_async_engine(
 )
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
-_voice_budget_ms = int(float(os.getenv("RAG_VOICE_RETRIEVAL_TIMEOUT_SECONDS", "2.5")) * 1000)
+_voice_budget_ms = int(float(os.getenv("RAG_VOICE_RETRIEVAL_TIMEOUT_SECONDS", "1.7")) * 1000)
 _voice_statement_timeout_ms = int(os.getenv("DB_VOICE_STATEMENT_TIMEOUT_MS", "750"))
 _voice_hnsw_iterative_scan = os.getenv("DB_VOICE_HNSW_ITERATIVE_SCAN", "relaxed_order").strip()
 if _voice_hnsw_iterative_scan not in {"off", "strict_order", "relaxed_order"}:

@@ -94,6 +94,8 @@ function VoiceApp({ onResetClient }) {
   const activeBotMessageIdRef = React.useRef(null);
   const toolCallPayloadsRef = React.useRef({});
   const voiceTurnTimingRef = React.useRef({
+    inputMode: null,
+    textSubmittedAt: null,
     speechStartedAt: null,
     speechStoppedAt: null,
     turnStopSignalAt: null,
@@ -454,9 +456,12 @@ function VoiceApp({ onResetClient }) {
       client_message_to_audio_ms: Math.round(
         (timing.firstRemoteAudioAt - pending.receivedPerfAt) * 10,
       ) / 10,
-      user_stop_to_playback_ms: timing.speechStoppedAt == null
+      user_stop_to_playback_ms: timing.inputMode === 'text' || timing.speechStoppedAt == null
         ? null
         : Math.round((timing.firstRemoteAudioAt - timing.speechStoppedAt) * 10) / 10,
+      text_send_to_playback_ms: timing.inputMode === 'text' && timing.textSubmittedAt != null
+        ? Math.round((timing.firstRemoteAudioAt - timing.textSubmittedAt) * 10) / 10
+        : null,
       turn_stop_signal_to_playback_ms: timing.turnStopSignalAt == null
         ? null
         : Math.round((timing.firstRemoteAudioAt - timing.turnStopSignalAt) * 10) / 10,
@@ -471,18 +476,35 @@ function VoiceApp({ onResetClient }) {
         : Math.round((timing.firstRemoteAudioAt - timing.botTtsStartedAt) * 10) / 10,
       playback_detected_unix_ms: Date.now(),
       playback_signal: 'first_nonzero_remote_audio_level',
-      speech_end_signal: timing.localSpeechObserved
-        ? 'last_nonzero_local_audio_level'
-        : 'server_turn_stop_event',
+      speech_end_signal: timing.inputMode === 'text'
+        ? 'text_submitted'
+        : timing.localSpeechObserved
+          ? 'last_nonzero_local_audio_level'
+          : 'server_turn_stop_event',
     };
 
     const webrtcMetrics = await collectWebRTCAudioStats(pcClient?.transport).catch(() => null);
+    const completeMetrics = {
+      ...(pending.serverPayload || {}),
+      ...clientMetrics,
+      ...(webrtcMetrics || {}),
+    };
     setLiveLatency((current) => (
       current?.turn_id === pending.turnId
-        ? { ...current, ...clientMetrics, ...(webrtcMetrics || {}) }
+        ? { ...current, ...completeMetrics }
         : current
     ));
     if (pendingLatencyRef.current === pending) pendingLatencyRef.current = null;
+    // Playback has already begun. Persist metrics out-of-band so telemetry
+    // cannot delay media or the next user turn.
+    void fetchWithAuth('/api/telemetry/voice-latency', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(completeMetrics),
+      timeoutMs: 2500,
+    }).catch((telemetryError) => {
+      console.warn('Could not persist voice latency telemetry', telemetryError);
+    });
   }, [pcClient]);
 
   useRTVIClientEvent(
@@ -531,6 +553,8 @@ function VoiceApp({ onResetClient }) {
       const timing = voiceTurnTimingRef.current;
       if (timing.speechStartedAt == null || timing.firstRemoteAudioAt != null) {
         voiceTurnTimingRef.current = {
+          inputMode: 'voice',
+          textSubmittedAt: null,
           speechStartedAt: performance.now(),
           speechStoppedAt: null,
           turnStopSignalAt: null,
@@ -661,12 +685,28 @@ function VoiceApp({ onResetClient }) {
       }
       if (messageData?.type === 'latency_stats' && messageData.payload) {
         const receivedPerfAt = performance.now();
+        const timing = voiceTurnTimingRef.current;
+        // RemoteAudioLevel can be unavailable or remain continuously non-zero
+        // across adjacent TTS responses. The server emits this message beside
+        // the first generated audio frame, so use its receipt as a bounded
+        // text-turn fallback and refine it later if decoded audio is observed.
+        const textSendToAudioMs = timing.inputMode === 'text' && timing.textSubmittedAt != null
+          ? Math.max(0, Math.round((receivedPerfAt - timing.textSubmittedAt) * 10) / 10)
+          : null;
         pendingLatencyRef.current = {
           turnId: messageData.payload.turn_id,
           receivedPerfAt,
+          serverPayload: messageData.payload,
         };
         setLiveLatency({
           ...messageData.payload,
+          text_send_to_playback_ms: textSendToAudioMs,
+          speech_end_signal: textSendToAudioMs == null
+            ? messageData.payload.speech_end_signal
+            : 'text_submitted',
+          playback_signal: textSendToAudioMs == null
+            ? messageData.payload.playback_signal
+            : 'first_audio_server_signal',
           client_received_unix_ms: Date.now(),
         });
         commitClientLatency();
@@ -752,13 +792,31 @@ function VoiceApp({ onResetClient }) {
     setError('');
     setIsSendingText(true);
     shouldAutoScrollRef.current = true;
+    const messageId = `text-${Date.now()}`;
+    voiceTurnTimingRef.current = {
+      inputMode: 'text',
+      textSubmittedAt: performance.now(),
+      speechStartedAt: null,
+      speechStoppedAt: null,
+      turnStopSignalAt: null,
+      lastLocalSpeechAt: null,
+      localSpeechObserved: false,
+      botTtsStartedAt: null,
+      firstRemoteAudioAt: null,
+      awaitingRemoteAudio: false,
+    };
+    pendingLatencyRef.current = null;
+    setLiveLatency(null);
+    addTranscript('You', content, false, messageId);
+    setTextInput('');
     try {
       await pcClient.sendText(content, {
         run_immediately: true,
         audio_response: true,
       });
-      setTextInput('');
     } catch (err) {
+      setTranscripts((items) => items.filter((item) => item.id !== messageId));
+      setTextInput(content);
       setError(err?.message || 'Could not send message');
     } finally {
       setIsSendingText(false);
@@ -872,6 +930,7 @@ function VoiceApp({ onResetClient }) {
               disabled={isConnecting || (!isActive && !canStart)}
               onClick={() => isActive ? enableMic(!isMicEnabled) : startConversation()}
               aria-label={isActive ? (isMicEnabled ? 'Mute microphone' : 'Unmute microphone') : 'Start conversation'}
+              aria-pressed={isActive && isMicEnabled}
               title={isActive ? (isMicEnabled ? 'Mute microphone' : 'Unmute microphone') : 'Start conversation'}
             >
               <Mic className="mic-icon" strokeWidth={2} />

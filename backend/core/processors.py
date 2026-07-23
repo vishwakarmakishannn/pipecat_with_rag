@@ -1,10 +1,11 @@
 import asyncio
 from array import array
+from collections.abc import Callable
 import json
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from loguru import logger
 from pipecat.frames.frames import (
     Frame,
@@ -63,7 +64,16 @@ def transport_server_message(message_type: str, payload: dict) -> OutputTranspor
 
 @dataclass
 class TurnLatencyState:
+    _gate_token: object = field(default_factory=object, repr=False)
+    llm_warm_state_getter: Callable[[], bool] | None = field(
+        default=None, repr=False
+    )
     session_id: str | None = None
+    llm_provider: str | None = None
+    llm_model: str | None = None
+    tts_provider: str | None = None
+    tts_model: str | None = None
+    llm_connection_warmed: bool = False
     turn_id: int = 0
     started_at: float | None = None
     first_llm_seen: bool = False
@@ -84,13 +94,20 @@ class TurnLatencyState:
     stage_times: dict[str, float] | None = None
     interim_stt_count: int = 0
     final_stt_fragment_count: int = 0
+    rag_considered: bool = False
+    rag_bypassed: bool = False
+    response_finished: bool = False
+    cancelled: bool = False
 
     def __post_init__(self):
         self.stage_times = {}
 
     @property
-    def priority_key(self) -> tuple[int, int]:
-        return (id(self), self.turn_id)
+    def priority_key(self) -> tuple[object, int]:
+        # Keep a strongly referenced token in the global gate. ``id(self)`` can
+        # be reused after a state is collected and accidentally collide with a
+        # leaked older turn.
+        return (self._gate_token, self.turn_id)
 
     def mark_user_started(self):
         if self.speech_turn_open:
@@ -131,11 +148,24 @@ class TurnLatencyState:
 
     def start_turn(self):
         if self.active:
-            return
+            # Text input can arrive after the previous answer has produced
+            # audio even if its completion frame did not close this state.
+            # Once audio was measured, a later context is a new user turn.
+            if not self.first_audio_seen:
+                return
+            self.finish_turn()
         if not self.turn_identity_open:
             # Text-only/no-VAD transports still need a stable turn identity.
             self.turn_id += 1
             self.turn_identity_open = True
+            # Unlike voice, text input has no TranscriptionFrame to replace
+            # these values. Clear every response origin when opening its new
+            # identity so timing cannot inherit the preceding text turn.
+            self.started_at = None
+            self.speech_started_at = None
+            self.speech_stopped_at = None
+            self.audio_speech_stopped_at = None
+            self.final_stt_at = None
             self.stage_times = {}
         self.active = True
         self.started_at = self.final_stt_at or time.monotonic()
@@ -150,6 +180,12 @@ class TurnLatencyState:
         self.tool_filler_spoken = False
         self.first_llm_ms = None
         self.first_speakable_text_ms = None
+        if self.llm_warm_state_getter:
+            self.llm_connection_warmed = bool(self.llm_warm_state_getter())
+        self.rag_considered = False
+        self.rag_bypassed = False
+        self.response_finished = False
+        self.cancelled = False
         self.mark_stage("turn_ready")
         realtime_turn_gate.begin(self.priority_key)
         self.emit("final_stt")
@@ -177,11 +213,22 @@ class TurnLatencyState:
         self.stage_times["final_stt"] = self.final_stt_at
         self.emit("final_stt_fragment")
 
+    def finish_response(self):
+        """Close LLM processing without releasing work ahead of first audio."""
+        self.response_finished = True
+        self.active = False
+        self.speech_turn_open = False
+        if self.first_audio_seen:
+            realtime_turn_gate.end(self.priority_key)
+            self.turn_identity_open = False
+
     def finish_turn(self):
+        """Force-close a cancelled/no-audio turn and release its gate."""
         realtime_turn_gate.end(self.priority_key)
         self.active = False
         self.speech_turn_open = False
         self.turn_identity_open = False
+        self.cancelled = True
 
     def telemetry_payload(self) -> dict:
         origin = self.speech_stopped_at or self.final_stt_at or self.started_at
@@ -195,7 +242,13 @@ class TurnLatencyState:
         if self.speech_started_at is not None and self.speech_stopped_at is not None:
             speech_ms = round((self.speech_stopped_at - self.speech_started_at) * 1000, 1)
         return {
+            "session_id": self.session_id,
             "basis": "user_stopped" if self.speech_stopped_at is not None else "final_stt",
+            "llm_provider": self.llm_provider,
+            "llm_model": self.llm_model,
+            "tts_provider": self.tts_provider,
+            "tts_model": self.tts_model,
+            "llm_connection_warmed": self.llm_connection_warmed,
             "speech_ms": speech_ms,
             "interim_stt_count": self.interim_stt_count,
             "final_stt_fragment_count": self.final_stt_fragment_count,
@@ -235,6 +288,8 @@ class LatencyBoundaryProcessor(FrameProcessor):
                 self._state.mark_vad_user_stopped(frame.stop_secs)
             elif self._boundary == "turn" and isinstance(frame, LLMContextFrame):
                 self._state.start_turn()
+            elif self._boundary == "turn" and isinstance(frame, InterruptionFrame):
+                self._state.finish_turn()
             elif self._boundary == "stt" and isinstance(frame, TranscriptionFrame):
                 self._state.record_final_stt_fragment()
             elif self._boundary == "stt" and isinstance(frame, InterimTranscriptionFrame):
@@ -257,9 +312,17 @@ class LatencyBoundaryProcessor(FrameProcessor):
                     self._state.emit("first_speakable_text")
             elif (
                 self._boundary == "tts"
+                and isinstance(frame, TTSStartedFrame)
+                and self._state.first_llm_seen
+            ):
+                self._state.mark_stage("tts_request_started")
+                self._state.emit("tts_request_started")
+            elif (
+                self._boundary == "tts"
                 and isinstance(frame, TTSAudioRawFrame)
                 and self._state.first_llm_seen
                 and not self._state.first_audio_seen
+                and not self._state.cancelled
             ):
                 self._state.first_audio_seen = True
                 realtime_turn_gate.end(self._state.priority_key)
@@ -276,6 +339,13 @@ class LatencyBoundaryProcessor(FrameProcessor):
                 final_stt_to_audio_ms = round(
                     (audio_at - self._state.final_stt_at) * 1000, 1
                 ) if self._state.final_stt_at else None
+                stages = self._state.stage_times or {}
+                speakable_at = stages.get("first_speakable_text")
+                tts_request_at = stages.get("tts_request_started")
+
+                def stage_delta(start, end):
+                    return round((end - start) * 1000, 1) if start and end else None
+
                 category = "tool" if self._state.tool_used else "rag" if self._state.rag_used else "direct"
                 telemetry_frame = OutputTransportMessageFrame({
                         "label": "rtvi-ai",
@@ -287,14 +357,30 @@ class LatencyBoundaryProcessor(FrameProcessor):
                                 "category": category,
                                 "with_tools": self._state.tool_used,
                                 "rag_used": self._state.rag_used,
+                                "rag_considered": self._state.rag_considered,
+                                "rag_bypassed": self._state.rag_bypassed,
                                 "llm_ms": self._state.first_llm_ms,
                                 "speakable_text_ms": self._state.first_speakable_text_ms,
+                                "tts_aggregation_ms": stage_delta(speakable_at, tts_request_at),
+                                "tts_provider_ms": stage_delta(tts_request_at, audio_at),
+                                "speakable_to_audio_ms": stage_delta(speakable_at, audio_at),
                                 "answer_audio_ms": total_ms,
                                 "final_stt_to_audio_ms": final_stt_to_audio_ms,
                                 **self._state.telemetry_payload(),
                             },
                         },
                     })
+                if self._state.response_finished:
+                    self._state.turn_identity_open = False
+            elif (
+                self._boundary == "tts"
+                and isinstance(frame, TTSStoppedFrame)
+                and self._state.first_llm_seen
+                and not self._state.first_audio_seen
+            ):
+                # Empty, cancelled, or provider-failed responses must never
+                # leave background enrichment gated forever.
+                self._state.finish_turn()
         await self.push_frame(frame, direction)
         if telemetry_frame:
             await self.push_frame(telemetry_frame, direction)
@@ -788,6 +874,7 @@ class ContextRetrievalProcessor(FrameProcessor):
         context: LLMContext,
         latency_state: TurnLatencyState | None = None,
         web_search=None,
+        ready_corpus_check=None,
         filler_delay_seconds: float | None = None,
         filler_enabled: bool | None = None,
         **kwargs,
@@ -798,6 +885,7 @@ class ContextRetrievalProcessor(FrameProcessor):
         self._context = context
         self._latency_state = latency_state
         self._web_search = web_search
+        self._ready_corpus_check = ready_corpus_check
         self._active_task: asyncio.Task | None = None
         self._retrieval_generation = 0
         self._dynamic_messages: list[dict] = []
@@ -995,7 +1083,33 @@ class ContextRetrievalProcessor(FrameProcessor):
                 return
 
             needs_memory = is_recall_query(combined_query)
-            needs_rag = should_attempt_rag_retrieval(combined_query)
+            rag_considered = should_attempt_rag_retrieval(combined_query)
+            needs_rag = rag_considered
+            if self._latency_state:
+                self._latency_state.rag_considered = rag_considered
+            if rag_considered and self._ready_corpus_check:
+                try:
+                    has_ready_corpus = await asyncio.wait_for(
+                        self._ready_corpus_check(self._user_id),
+                        timeout=0.1,
+                    )
+                except Exception as exc:
+                    # Corpus discovery is an optimization. Fail open for an
+                    # explicit source question so RAG availability is not lost
+                    # during a transient status-check failure.
+                    logger.warning(
+                        "voice_route corpus_check=failed action=retrieve error_type={}",
+                        type(exc).__name__,
+                    )
+                    has_ready_corpus = True
+                if not has_ready_corpus:
+                    needs_rag = False
+                    if self._latency_state:
+                        self._latency_state.rag_bypassed = True
+                    logger.info(
+                        "voice_route route=direct reason=no_ready_corpus query={!r}",
+                        combined_query[:120],
+                    )
             needs_web = bool(
                 self._web_search
                 and ToolRoutingProcessor.needs_web_search(combined_query)
@@ -1272,5 +1386,5 @@ class TurnContextCleanupProcessor(FrameProcessor):
         if direction == FrameDirection.DOWNSTREAM and isinstance(frame, LLMFullResponseEndFrame):
             self._retrieval.finish_response()
             if self._latency_state:
-                self._latency_state.finish_turn()
+                self._latency_state.finish_response()
         await self.push_frame(frame, direction)
